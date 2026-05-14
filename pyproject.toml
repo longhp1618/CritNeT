@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "critnet"
+version = "0.1.0"
+description = "CritNet: A Critical Neurons Toolkit — core library and LIMA-S1 experiment suite."
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+include = ["critnet*", "lima_s1_exp*"]
+
+[tool.black]
+line-length = 150
+target-version = ['py39']
+skip-string-normalization = true
+
+[tool.isort]
+profile = "black"  # Use Black-compatible settings
+line_length = 150
+known_first_party = ["critnet", "lima_s1_exp"]
+default_section = "THIRDPARTY"
+skip_gitignore = true

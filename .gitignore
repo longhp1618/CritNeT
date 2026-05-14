@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data artifacts (too large for git)
+neuron_detect/
+neuron_statistics/
+neuron_pairwise_stats/
+importance_cache/
+deactivate_model_param/
+deactivate_tmp/
+saved_models/
+saved_adapters/
+saved_checkpoint_alllangs/
+checkpoints/
+post_trained_model/
+
+# Eval predictions (generated at runtime)
+lima_s1_exp/eval/predictions/
+lima_s1_exp/results/
+
+# Training logs
+wandb/
+
+# OS
+*.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+lima_s1_exp/*
