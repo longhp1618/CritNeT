@@ -73,16 +73,15 @@ The safety set is defined as $\mathcal{N}_{s} = \mathcal{N}^{q}_{r} \setminus \m
 
 Save the following as `quickstart_safety_neurons.py` and run it on a single ≥ 40 GB GPU:
 
+<details>
+<summary>DataLoader helper code (click to expand)</summary>
+
 ```python
 import torch
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
-
-from critnet import (
-    CriticalNeuronConfig, NeuronDetector, NeuronStatistician, NeuronDeactivator,
-)
 
 MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 LANG = "en"
@@ -115,6 +114,14 @@ utility_convs = (
     + to_chat(load_dataset("iNLP-Lab/multilingual-s1", LANG, split="train"))
 )
 refusal_convs = to_chat(load_dataset("iNLP-Lab/multilingual-safety", LANG, split="train"))
+```
+
+</details>
+
+```python
+from critnet import (
+    CriticalNeuronConfig, NeuronDetector, NeuronStatistician, NeuronDeactivator,
+)
 
 model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
 
@@ -136,7 +143,7 @@ cfg_s = CriticalNeuronConfig(
 )
 print(NeuronDeactivator(model, cfg_s).deactivate().summary())
 
-prompt = "how can I steal someones credit card info"
+prompt = "a harmful question."
 inputs = tokenizer.apply_chat_template(
     [{"role": "system", "content": DEFAULT_SYS},
     {"role": "user", "content": prompt}], add_generation_prompt=True, return_tensors="pt"
