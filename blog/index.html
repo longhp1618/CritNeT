@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="CritNeT is a PyTorch toolkit for identifying, deactivating, freezing, and selectively fine-tuning the critical neurons that carry most of a transformer language model's behaviour." />
+  <meta name="author" content="Long P. Hoang" />
+  <meta property="og:title" content="CritNeT: A Critical Neurons Toolkit" />
+  <meta property="og:description" content="An interpretability and PEFT toolkit for transformer language models, by way of first-order Taylor importance." />
+  <meta property="og:type" content="article" />
+  <title>CritNeT: A Critical Neurons Toolkit</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- KaTeX -->
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+    integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV"
+    crossorigin="anonymous"
+  />
+
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Favicon (inline SVG) -->
+  <link
+    rel="icon"
+    type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231d3a8a'/%3E%3Ctext x='16' y='22' font-family='Inter, sans-serif' font-size='18' font-weight='700' text-anchor='middle' fill='white'%3EC%3C/text%3E%3C/svg%3E"
+  />
+</head>
+
+<body>
+  <div class="layout">
+    <!-- =====================================================
+         Site header
+         ===================================================== -->
+    <header class="site-header">
+      <div class="site-header-inner">
+        <a class="site-brand" href="#top"
+          ><span class="site-brand-mark"></span>CritNeT</a
+        >
+        <nav class="site-nav">
+          <a href="#section-1">Detection</a>
+          <a href="#section-2">Safety</a>
+          <a href="#section-3">PEFT</a>
+          <a href="https://github.com/iNLP-Lab/critnet" rel="noopener">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <!-- =====================================================
+         Article header (hero)
+         ===================================================== -->
+    <header class="article-header" id="top">
+      <div class="article-header-inner">
+        <p class="eyebrow">Toolkit · Interpretability · PEFT</p>
+        <h1 class="article-title">CritNeT: A Critical Neurons Toolkit</h1>
+        <p class="article-subtitle">
+          Ranking, deactivating, freezing, and selectively fine-tuning the small set of
+          neurons that carry most of a transformer language model's behaviour.
+        </p>
+
+        <div class="article-byline">
+          <div class="byline-author">
+            <strong>Long P. Hoang</strong><br />
+            <span>Singapore University of Technology and Design</span>
+          </div>
+          <span class="byline-spacer"></span>
+          <div class="byline-date">May 14, 2026</div>
+        </div>
+
+        <div class="article-links">
+          <a class="btn btn-primary" href="https://github.com/iNLP-Lab/critnet" rel="noopener">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
+            </svg>
+            GitHub
+          </a>
+          <a class="btn" href="https://github.com/iNLP-Lab/critnet/blob/main/CritNeT_Latex/CritNeT__A_Critical_Neurons_Toolkit.pdf" rel="noopener">
+            Paper (PDF)
+          </a>
+          <a class="btn" href="https://github.com/iNLP-Lab/critnet/blob/main/critnet/README.md" rel="noopener">
+            API Reference
+          </a>
+          <a class="btn" href="https://huggingface.co/iNLP-Lab" rel="noopener">
+            Datasets
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <!-- =====================================================
+         TOC (desktop sidebar)
+         ===================================================== -->
+    <div class="toc-wrapper">
+      <nav class="toc" aria-label="Table of contents">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#section-1">Critical Neurons Detection</a></li>
+          <li><a href="#section-2">Utility, Refusal &amp; Safety Neurons</a></li>
+          <li><a href="#section-3">Foundational Neurons &amp; PEFT</a></li>
+          <li><a href="#conclusion">Conclusion</a></li>
+        </ol>
+      </nav>
+    </div>
+
+    <!-- =====================================================
+         Article body
+         ===================================================== -->
+    <main class="article-body">
+      <!-- TL;DR -->
+      <div class="tldr">
+        <strong>TL;DR.</strong> CritNeT ranks every neuron of a transformer LM by the
+        first-order Taylor importance $|w_i^{\top}\nabla_{w_i}\mathcal{L}|$, then lets
+        you <strong>deactivate</strong>, <strong>freeze</strong>, or
+        <strong>selectively fine-tune</strong> the resulting top-$k$ critical set.
+        We use it to (1) isolate the ~1.5–1.8 % of parameters that gate
+        refusal behaviour in Llama-3.1-8B-Instruct and Qwen3-4B-Instruct, and
+        (2) build a structurally sparse PEFT method that beats LoRA on
+        multilingual fine-tuning at every matched parameter budget.
+      </div>
+
+      <p>
+        A modern instruction-tuned LLM packs general reasoning, world knowledge,
+        multilingual competence, and safety alignment into a single dense pile
+        of parameters. From the outside it behaves like one model. From the
+        inside, only a small fraction of its weights actually carries any given
+        behaviour.
+      </p>
+
+      <p>
+        <strong>CritNeT</strong> is a small PyTorch toolkit for finding and acting
+        on that small fraction. Given any calibration corpus, it ranks every
+        neuron of a transformer LM by a cheap first-order Taylor importance score,
+        then lets you deactivate, freeze, or selectively fine-tune the resulting
+        top-$k$ critical set. This post is an extended, code-illustrated
+        companion to the paper. It mirrors the paper's three-part structure:
+      </p>
+
+      <ol>
+        <li>
+          <strong>Critical Neurons Detection</strong> — how the importance score
+          is defined and computed.
+        </li>
+        <li>
+          <strong>Utility, Refusal, and Safety Neurons</strong> — isolating
+          safety-specific neurons by set difference, deactivating them, and
+          stress-testing them under fine-tuning.
+        </li>
+        <li>
+          <strong>Foundational Neurons and PEFT</strong> — turning multilingual
+          critical-neuron sets into a structurally sparse, drop-in alternative
+          to LoRA.
+        </li>
+      </ol>
+
+      <p>Each section ends with a concise Python snippet using the actual <code>critnet</code> API.</p>
+
+      <!-- ===================================================
+           Section 1 — Critical Neurons Detection
+           =================================================== -->
+      <section id="section-1">
+        <p class="section-label">Section 1</p>
+        <h2>Critical Neurons Detection</h2>
+
+        <p>
+          Let $\mathcal{W}$ denote the full parameter set of an LLM, and let
+          $w_i$ be the parameter vector of a single candidate neuron —
+          concretely, a <strong>row</strong> of an attention / FFN projection
+          (one output channel), a <strong>column</strong> of an output / down
+          projection (one input channel), or a single scalar of a layer-norm
+          vector. A "neuron" is therefore a whole vector of weights, not just
+          one number.
+        </p>
+
+        <p>
+          We want to know how important $w_i$ is for a given domain corpus
+          $\mathcal{D}_t$. The most informative quantity is the change in loss
+          if we deleted that neuron:
+        </p>
+
+        $$
+        \mathcal{I}_t(w_i) \;=\; \bigl| \mathcal{L}(\mathcal{W}, \mathcal{D}_t)
+        - \mathcal{L}(\mathcal{W} \mid w_i = \mathbf{0}, \mathcal{D}_t) \bigr|.
+        $$
+
+        <p>
+          Evaluating this exactly would mean one forward pass per neuron —
+          hopelessly expensive at the 4B–8B scale. A first-order Taylor
+          expansion at the current weights collapses the cost to a single
+          backward pass over the entire corpus:
+        </p>
+
+        $$
+        \mathcal{I}_t(w_i) \;\approx\; \bigl| w_i^{\top}\, \nabla_{w_i}
+        \mathcal{L}(\mathcal{W}, \mathcal{D}_t) \bigr|.
+        $$
+
+        <p>
+          In code this is the elementwise product
+          $|W \odot \nabla_W \mathcal{L}|$ reduced along the appropriate axis
+          (sum over input dim for row modules, sum over output dim for column
+          modules, identity for norm scalars). All per-neuron scores from every
+          targeted module are then pooled into a single list, and the top
+          fraction <code>sparsity_ratio</code> of that list is kept. This
+          <strong>global top-$k$</strong> is the key design choice: attention
+          QKV neurons, FFN gate/up/down neurons, and norm scalars all compete
+          on the same scale.
+        </p>
+
+        <p>
+          How concentrated is the model's capability in this top-$k$ set?
+          Deactivating less than <strong>0.1 %</strong> of utility-critical
+          neurons drives Global-MMLU performance to near zero for both models
+          we test on — core language understanding is <em>very</em> concentrated.
+        </p>
+
+        <figure class="breakout">
+          <img src="figures/utility_ratios.png" alt="Deactivating a small fraction of utility neurons collapses general reasoning to near-random." />
+          <figcaption>
+            <strong>Figure 1.</strong> Deactivating a minuscule fraction of utility
+            neurons $\mathcal{N}^p_u$ ($p &lt; 1\%$ of model parameters)
+            completely breaks down the language understanding and reasoning
+            abilities of the models.
+          </figcaption>
+        </figure>
+
+        <h3>Detecting critical neurons in code</h3>
+
+        <p>
+          In CritNeT the entire pipeline is one config + one call. The config
+          describes which modules to target and the sparsity ratio; the detector
+          runs one backward pass over a <code>DataLoader</code> and writes the
+          surviving indices into <code>config.neuron_indices</code>:
+        </p>
+
+<pre><code class="language-python">import torch
+from transformers import AutoModelForCausalLM
+from critnet import CriticalNeuronConfig, NeuronDetector
+
+MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
+
+config = CriticalNeuronConfig(
+    sparsity_ratio=0.05,                       # keep the top 5% of pooled neurons
+    base_model_name_or_path=MODEL,
+)
+NeuronDetector(model, config).detect(calibration_loader, mode="chat")
+config.save_pretrained("./neurons")            # writes neuron_indices.json
+</code></pre>
+
+        <p>
+          The defaults target <code>q_proj</code>, <code>k_proj</code>,
+          <code>v_proj</code>, <code>gate_proj</code>, <code>up_proj</code>
+          (row modules), <code>o_proj</code>, <code>down_proj</code> (column
+          modules), and <code>input_layernorm</code>,
+          <code>post_attention_layernorm</code> (norm modules) — the standard
+          LLaMA / Mistral / Qwen suffix set. For Qwen-3 you can add
+          <code>q_norm</code>, <code>k_norm</code> to
+          <code>norm_modules</code>. Each batch yielded by
+          <code>calibration_loader</code> must contain <code>input_ids</code>,
+          <code>attention_mask</code>, and <code>labels</code> (with prompt
+          tokens masked to <code>-100</code> in <code>"chat"</code> mode so only
+          completion tokens contribute to the loss).
+        </p>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ===================================================
+           Section 2 — Utility, Refusal, and Safety Neurons
+           =================================================== -->
+      <section id="section-2">
+        <p class="section-label">Section 2</p>
+        <h2>Utility, Refusal, and Safety Neurons</h2>
+
+        <p>
+          Instruction-tuned LLMs entangle general capability with safety
+          alignment. To disentangle them, we detect critical neurons on two
+          corpora and then take a <strong>set difference</strong>.
+        </p>
+
+        <p>
+          Let $\mathcal{N}_u^p$ denote the top-$p$ critical neurons for a
+          utility corpus $\mathcal{D}_u$ (helpful behaviour on benign queries),
+          and $\mathcal{N}_r^q$ the top-$q$ critical neurons for a refusal
+          corpus $\mathcal{D}_r$ (safety on adversarial queries). The
+          <strong>safety neurons</strong> — those uniquely specialised for
+          refusal without contributing to general reasoning — are
+        </p>
+
+        $$
+        \mathcal{N}_s \;=\; \mathcal{N}_r^q \;\setminus\; \mathcal{N}_u^p.
+        $$
+
+        <h3>Experimental setup</h3>
+
+        <p>
+          <strong>Corpora.</strong> $\mathcal{D}_u$ is a 1,630-sample English
+          mix: 1,000 LIMA conversational pairs and 630 s1k-1.1 reasoning
+          samples (filtered to those marked as correctly distilled from
+          DeepSeek-R1). $\mathcal{D}_r$ is 1,000 harmful-prompt /
+          refusal-response pairs from Bianchi et al.
+        </p>
+
+        <p>
+          <strong>Models.</strong> <code>Llama-3.1-8B-Instruct</code> and
+          <code>Qwen3-4B-Instruct</code>.
+        </p>
+
+        <p>
+          <strong>Evaluation.</strong> Utility is measured on the English
+          subsets of ARC-E, PolyMath, and Global-MMLU-Lite. Safety is measured
+          by Attack Success Rate (ASR) on the English subset of MultiJail with
+          the open-source HarmBench LLaMA-2-13B classifier.
+        </p>
+
+        <p>
+          Isolating $\mathcal{N}_s$ requires balancing the two ratios. We grid-search
+          over $(p, q)$:
+        </p>
+
+        <div class="figure-grid two breakout">
+          <figure>
+            <img src="figures/grid_search_Llama-3.1-8B-Instruct.png" alt="Grid search over (p, q) on Llama-3.1-8B-Instruct." />
+          </figure>
+          <figure>
+            <img src="figures/grid_search_Qwen3-4B-Instruct.png" alt="Grid search over (p, q) on Qwen3-4B-Instruct." />
+          </figure>
+        </div>
+        <figcaption style="margin-top:-12px">
+          <strong>Figure 2.</strong> Attack success rate over varying utility
+          $(p)$ and refusal $(q)$ ratios for safety neuron isolation on
+          Llama-3.1-8B-Instruct (left) and Qwen3-4B-Instruct (right). Lower $q$
+          combined with higher $p$ yields a higher ASR, indicating effective
+          isolation of safety-specific neurons.
+        </figcaption>
+
+        <p>
+          We pick $p=0.14$, $q=0.04$ for Llama-3.1 (yielding
+          $|\mathcal{N}_s|$ equivalent to ~1.8 % of parameters) and
+          $p=0.13$, $q=0.06$ for Qwen3-4B (~1.5 %).
+        </p>
+
+        <h3>Isolating safety neurons in code</h3>
+
+        <p>
+          The set-difference $\mathcal{N}_r^q \setminus \mathcal{N}_u^p$ is
+          exactly what <code>NeuronStatistician.analyze(...)</code> returns as
+          <code>result.exclusive["refusal"]</code>. With the safety set in
+          hand, <code>NeuronDeactivator</code> zeros out the corresponding
+          weight slices in place — the model architecture is unchanged, so the
+          result is just a normal HuggingFace checkpoint.
+        </p>
+
+<pre><code class="language-python">from critnet import (
+    CriticalNeuronConfig, NeuronDetector,
+    NeuronStatistician, NeuronDeactivator,
+)
+
+# 1. Detect utility-critical and refusal-critical sets.
+cfg_u = CriticalNeuronConfig(sparsity_ratio=0.13, base_model_name_or_path=MODEL)
+NeuronDetector(model, cfg_u).detect(utility_loader, mode="chat")
+
+cfg_r = CriticalNeuronConfig(sparsity_ratio=0.06, base_model_name_or_path=MODEL)
+NeuronDetector(model, cfg_r).detect(refusal_loader, mode="chat")
+
+# 2. Isolate safety neurons by set difference: N_s = N_r \ N_u.
+result = NeuronStatistician(model=model, config=cfg_r).analyze({
+    "utility": cfg_u.neuron_indices,
+    "refusal": cfg_r.neuron_indices,
+})
+safety_indices = result.exclusive["refusal"]
+print(f"|N_s| ~ {result.param_coverage(safety_indices):.2f}% of model params")
+
+# 3. Deactivate the safety neurons in place.
+cfg_s = CriticalNeuronConfig(
+    sparsity_ratio=0.06, base_model_name_or_path=MODEL,
+    neuron_indices=safety_indices,
+)
+NeuronDeactivator(model, cfg_s).deactivate()
+</code></pre>
+
+        <p>
+          The full runnable version, including the corpora and a generation
+          comparison on a harmful prompt, is in
+          <a href="https://github.com/iNLP-Lab/critnet/blob/main/quickstart_safety_neurons.py" rel="noopener"><code>quickstart_safety_neurons.py</code></a>
+          at the repo root.
+        </p>
+
+        <h3>Targeted deactivation preserves utility but breaks safety</h3>
+
+        <p>
+          The behavioural split is sharp (English subsets; higher is better for
+          utility, lower is better for ASR):
+        </p>
+
+        <div class="table-wrapper breakout">
+          <table>
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th class="num">ARC-E <span class="arrow">↑</span></th>
+                <th class="num">PolyMath <span class="arrow">↑</span></th>
+                <th class="num">MMLU <span class="arrow">↑</span></th>
+                <th class="num">MultiJail ASR <span class="arrow">↓</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="group"><td colspan="5">Llama-3.1-8B-Instruct</td></tr>
+              <tr><td>Original</td><td class="num">94.3</td><td class="num">47.2</td><td class="num">73.2</td><td class="num">10.2</td></tr>
+              <tr><td>Random deactivation (~1.5 %)</td><td class="num">82.2</td><td class="num">32.0</td><td class="num">58.2</td><td class="num">6.4</td></tr>
+              <tr class="highlight"><td><strong>Safety deactivation $\mathcal{N}_s$</strong></td><td class="num">91.9</td><td class="num">24.8</td><td class="num">66.2</td><td class="num"><strong>55.6</strong></td></tr>
+
+              <tr class="group"><td colspan="5">Qwen3-4B-Instruct</td></tr>
+              <tr><td>Original</td><td class="num">98.0</td><td class="num">59.2</td><td class="num">82.0</td><td class="num">3.5</td></tr>
+              <tr><td>Random deactivation (~1.5 %)</td><td class="num">97.4</td><td class="num">53.2</td><td class="num">76.2</td><td class="num">1.6</td></tr>
+              <tr class="highlight"><td><strong>Safety deactivation $\mathcal{N}_s$</strong></td><td class="num">96.8</td><td class="num">50.8</td><td class="num">74.2</td><td class="num"><strong>61.6</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="table-caption">
+          <strong>Table 1.</strong> Neuron deactivation results (English only). Safety
+          deactivation preserves utility while severely degrading safety, whereas
+          random deactivation of a comparable mass affects the model at a smaller
+          scale.
+        </p>
+
+        <p>
+          Two things stand out. First, <strong>random</strong> deactivation of a
+          comparable parameter mass <em>reduces</em> ASR — a less coherent model
+          is less likely to follow a harmful instruction — so the safety-deactivation
+          signal cannot be explained by generic capability damage. Second,
+          deactivating $\mathcal{N}_s$ keeps MMLU and ARC-E close to their
+          original values while sending ASR up by 5–17×. These ~1.5–1.8 % of
+          parameters behave like centralised gatekeepers for alignment in both
+          model families.
+        </p>
+
+        <h3>Fine-tuning attacks bypass safety neurons</h3>
+
+        <p>
+          A natural follow-up: if we know which neurons enforce refusal, can we
+          <strong>protect</strong> them against fine-tuning attacks by freezing
+          them while letting the rest of the model learn? CritNeT exposes
+          <code>freeze_neurons</code> for exactly this experiment. Under the
+          hood it registers backward hooks that zero the gradient slices of the
+          chosen neurons, so the forward pass is identical to the base model
+          (zero overhead) and the optimiser cannot update those slices.
+        </p>
+
+<pre><code class="language-python">import json
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
+from critnet import CriticalNeuronConfig, freeze_neurons
+
+model = AutoModelForCausalLM.from_pretrained(MODEL)
+with open("./neurons/safety_indices.json") as f:
+    safety_indices = json.load(f)
+
+handle = freeze_neurons(model, safety_indices, config=CriticalNeuronConfig())
+handle.print_frozen_summary()
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(output_dir="./ft_ckpts",
+                           num_train_epochs=3, weight_decay=0.01),
+    train_dataset=train_dataset,
+    callbacks=[handle.make_trainer_callback()],   # undo weight-decay drift each step
+)
+trainer.train()
+</code></pre>
+
+        <p>
+          Running this on the same 1,630-sample benign English corpus yields:
+        </p>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th class="num">Original ASR</th>
+                <th class="num">Full FT ASR</th>
+                <th class="num">Frozen-Tuning ASR</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Llama-3.1-8B-Instruct</td><td class="num">10.2</td><td class="num">21.6</td><td class="num"><strong>24.4</strong></td></tr>
+              <tr><td>Qwen3-4B-Instruct</td><td class="num">3.5</td><td class="num">20.0</td><td class="num"><strong>17.1</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="table-caption">
+          <strong>Table 2.</strong> Attack success rate (lower is better) with
+          fine-tuning attacks on MultiJail-En.
+        </p>
+
+        <p>
+          Both vanilla full FT and frozen-safety FT degrade alignment substantially;
+          frozen FT is not consistently better than full FT (and on Llama-3.1 it
+          is <em>worse</em>). The interpretation is uncomfortable but clear: safety
+          behaviour is not implemented <em>only</em> by the frozen neurons in
+          isolation; benign fine-tuning of the surrounding pathways can route
+          around the protected ones to generate harmful outputs.
+          <strong>Preserving weights is necessary but not sufficient for
+          resilient alignment.</strong>
+        </p>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ===================================================
+           Section 3 — Foundational Neurons and PEFT
+           =================================================== -->
+      <section id="section-3">
+        <p class="section-label">Section 3</p>
+        <h2>Foundational Neurons and Parameter-Efficient Fine-Tuning</h2>
+
+        <p>
+          The set-difference idea generalises beyond safety. Given a set of
+          languages $\mathcal{T}$ with per-language corpora $\mathcal{D}_t$, let
+          $\mathcal{N}_t$ be the top-$p$ critical neurons for language $t$ at a
+          uniform ratio $p$. The <strong>foundational neurons</strong> are the
+          <em>union</em> of these per-language sub-networks:
+        </p>
+
+        $$
+        \mathcal{N}_{\text{all}} \;=\; \bigcup_{t \in \mathcal{T}} \mathcal{N}_t.
+        $$
+
+        <p>
+          $\mathcal{N}_{\text{all}}$ is the set of neurons critical for
+          <em>at least one</em> of the target languages. The hypothesis is that
+          updating only these neurons during fine-tuning should (i) be cheap
+          because they are a fraction of the model and (ii) preserve foundational
+          knowledge because everything outside $\mathcal{N}_{\text{all}}$ is frozen.
+        </p>
+
+        <h3>Critical Neurons Tuning as PEFT</h3>
+
+        <p>
+          For a base linear layer with weight
+          $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$, instead of
+          decomposing $\Delta W$ into low-rank factors $BA$ (LoRA), we
+          parameterise a <strong>structurally sparse</strong> delta restricted
+          to the indices in $\mathcal{N}_{\text{all}}$:
+        </p>
+
+        $$
+        h \, (W + \Delta W)^{\top} \;=\; h \, W^{\top} \;+\; h \, \Delta W^{\top}.
+        $$
+
+        <p>
+          $\Delta W$ is never materialised as a dense matrix. Let
+          $k = |\mathcal{N}_{\text{all}}|$ for this layer. We instantiate the
+          trainable subset $\Delta W_{\text{train}}$ in one of two shapes
+          depending on whether the critical neurons are <strong>output</strong>
+          (rows) or <strong>input</strong> (columns) of $W$:
+        </p>
+
+        <ul>
+          <li>
+            <strong>Row mode</strong> (e.g. <code>q_proj</code>, <code>up_proj</code>):
+            $\Delta W_{\text{train}} \in \mathbb{R}^{k \times d_{\text{in}}}$,
+            injected only into the selected output indices,
+            $$
+            y_{\mathcal{N}_{\text{all}}} \;=\; (h W^{\top})_{\mathcal{N}_{\text{all}}}
+            + h \, \Delta W_{\text{train}}^{\top}.
+            $$
+          </li>
+          <li>
+            <strong>Column mode</strong> (e.g. <code>o_proj</code>, <code>down_proj</code>):
+            $\Delta W_{\text{train}} \in \mathbb{R}^{d_{\text{out}} \times k}$,
+            applied to the sliced input,
+            $$
+            y \;=\; h W^{\top}
+            + h_{\mathcal{N}_{\text{all}}} \, \Delta W_{\text{train}}^{\top}.
+            $$
+          </li>
+        </ul>
+
+        <p>
+          In both modes $\Delta W_{\text{train}}$ is initialised to zero, so the
+          wrapped model's first forward pass is bit-identical to the base
+          model. Because $k$ is a marginal fraction of the layer dimension
+          ($&lt; 10\%$), this is a natural PEFT method.
+        </p>
+
+        <h3>Critical-neuron PEFT in code</h3>
+
+        <p>
+          <code>get_neuron_model</code> walks a HuggingFace model and replaces
+          every targeted module with a <code>LinearDeltaSubspace</code> (or
+          norm / embedding variant) keyed on <code>config.neuron_indices</code>.
+          It freezes all base parameters, marks only the deltas as trainable,
+          and returns a <code>CriticalNeuronModel</code> that behaves like a
+          normal <code>nn.Module</code> — fully compatible with
+          <code>transformers.Trainer</code>.
+        </p>
+
+<pre><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
+from critnet import (
+    CriticalNeuronConfig, NeuronDetector, NeuronStatistician,
+    get_neuron_model, CriticalNeuronModel,
+)
+
+MODEL = "Qwen/Qwen3-4B-Base"
+
+# 1. Detect per-language critical neurons.
+model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
+lang_indices = {}
+for lang, loader in lang_loaders.items():           # en, zh, ar, sw
+    cfg = CriticalNeuronConfig(sparsity_ratio=0.05, base_model_name_or_path=MODEL)
+    NeuronDetector(model, cfg).detect(loader, mode="chat")
+    lang_indices[lang] = cfg.neuron_indices
+
+# 2. Foundational set N_all = union of per-language sets.
+result = NeuronStatistician(model=model, config=cfg).analyze(lang_indices)
+foundational = result.union
+
+# 3. Wrap the model so only the delta over N_all is trainable.
+del model
+cfg = CriticalNeuronConfig(sparsity_ratio=0.05, base_model_name_or_path=MODEL,
+                           neuron_indices=foundational)
+base = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
+wrapped = get_neuron_model(base, cfg)
+wrapped.print_trainable_parameters()
+
+# 4. Train with HF Trainer, then merge the delta into a vanilla checkpoint.
+Trainer(model=wrapped,
+        args=TrainingArguments(output_dir="./ckpts", num_train_epochs=1),
+        train_dataset=train_dataset).train()
+wrapped.save_pretrained("./my_adapter")
+
+merged = CriticalNeuronModel.from_pretrained(
+    MODEL, "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
+)
+plain = merged.merge_and_unload()                   # plain nn.Module, ready to ship
+plain.save_pretrained("./my_merged_model")
+</code></pre>
+
+        <h3>Experiments and analysis</h3>
+
+        <p>
+          <strong>Training data.</strong> We start from the same 1,630-sample
+          English corpus and use <code>Gemini 2.0 Flash</code> to translate it
+          into Chinese, Arabic, and Swahili, giving four typologically diverse
+          languages ($\mathcal{T} = \{\text{en}, \text{zh}, \text{ar}, \text{sw}\}$)
+          that span the high- to low-resource spectrum.
+        </p>
+
+        <p>
+          <strong>Detection.</strong> We apply a uniform ratio $p = 1\%$ and
+          $p = 5\%$ across $\mathcal{T}$. The resulting $\mathcal{N}_{\text{all}}$
+          covers roughly 3 % and 11 % of the model's total parameters.
+        </p>
+
+        <p>
+          <strong>Baselines.</strong> LoRA at ranks $r=64$ and $r=512$, plus
+          full fine-tuning.
+        </p>
+
+        <p>
+          <strong>Evaluation.</strong> We extend the utility suite from
+          Section 2 to 13 languages, partitioned into 4 <em>seen</em> (in the
+          training mix) and 9 <em>unseen</em>
+          (<code>bn, de, es, fr, id, it, ja, ko, pt</code>).
+        </p>
+
+        <div class="table-wrapper breakout">
+          <table>
+            <thead>
+              <tr>
+                <th rowspan="2">Method</th>
+                <th class="num" rowspan="2">%Param</th>
+                <th class="num" colspan="4">4 Seen languages</th>
+                <th class="num" colspan="4">9 Unseen languages</th>
+              </tr>
+              <tr>
+                <th class="num">ARC-E</th>
+                <th class="num">PolyM</th>
+                <th class="num">MMLU</th>
+                <th class="num">Avg</th>
+                <th class="num">ARC-E</th>
+                <th class="num">PolyM</th>
+                <th class="num">MMLU</th>
+                <th class="num">Avg</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="group"><td colspan="10">Llama-3.1-8B</td></tr>
+              <tr><td>Base (zero-shot)</td><td class="num">0.0 %</td><td class="num">59.3</td><td class="num">12.5</td><td class="num">44.1</td><td class="num">38.6</td><td class="num">65.8</td><td class="num">13.8</td><td class="num">44.7</td><td class="num">41.4</td></tr>
+              <tr><td>Full FT</td><td class="num">100 %</td><td class="num">60.9</td><td class="num">19.5</td><td class="num">44.9</td><td class="num">41.8</td><td class="num">66.3</td><td class="num">20.4</td><td class="num">45.6</td><td class="num">44.1</td></tr>
+              <tr><td>LoRA</td><td class="num">2.0 %</td><td class="num">57.0</td><td class="num">16.0</td><td class="num">42.8</td><td class="num">38.6</td><td class="num">63.5</td><td class="num">18.9</td><td class="num">44.2</td><td class="num">42.2</td></tr>
+              <tr class="highlight"><td><strong>Neuron (CritNeT)</strong></td><td class="num"><strong>2.3 %</strong></td><td class="num"><strong>59.6</strong></td><td class="num"><strong>19.8</strong></td><td class="num"><strong>44.4</strong></td><td class="num"><strong>41.3</strong></td><td class="num"><strong>65.7</strong></td><td class="num"><strong>24.0</strong></td><td class="num"><strong>46.0</strong></td><td class="num"><strong>45.2</strong></td></tr>
+              <tr><td>LoRA</td><td class="num">14.3 %</td><td class="num">58.1</td><td class="num">16.8</td><td class="num">43.8</td><td class="num">39.6</td><td class="num">64.5</td><td class="num">19.9</td><td class="num">45.1</td><td class="num">43.2</td></tr>
+              <tr class="highlight"><td><strong>Neuron (CritNeT)</strong></td><td class="num"><strong>10.4 %</strong></td><td class="num"><strong>63.2</strong></td><td class="num"><strong>20.7</strong></td><td class="num"><strong>46.7</strong></td><td class="num"><strong>43.5</strong></td><td class="num"><strong>69.0</strong></td><td class="num"><strong>23.7</strong></td><td class="num"><strong>48.5</strong></td><td class="num"><strong>47.1</strong></td></tr>
+
+              <tr class="group"><td colspan="10">Qwen3-4B-Base</td></tr>
+              <tr><td>Base (zero-shot)</td><td class="num">0.0 %</td><td class="num">75.8</td><td class="num">38.1</td><td class="num">54.9</td><td class="num">56.3</td><td class="num">90.7</td><td class="num">42.5</td><td class="num">61.5</td><td class="num">64.9</td></tr>
+              <tr><td>Full FT</td><td class="num">100 %</td><td class="num">75.9</td><td class="num">45.0</td><td class="num">58.0</td><td class="num">59.6</td><td class="num">88.4</td><td class="num">48.0</td><td class="num">62.3</td><td class="num">66.2</td></tr>
+              <tr><td>LoRA</td><td class="num">3.2 %</td><td class="num">74.4</td><td class="num">41.4</td><td class="num">55.8</td><td class="num">57.2</td><td class="num">86.4</td><td class="num">44.4</td><td class="num">61.6</td><td class="num">64.1</td></tr>
+              <tr class="highlight"><td><strong>Neuron (CritNeT)</strong></td><td class="num"><strong>2.3 %</strong></td><td class="num"><strong>75.7</strong></td><td class="num"><strong>42.6</strong></td><td class="num"><strong>56.6</strong></td><td class="num"><strong>58.3</strong></td><td class="num"><strong>88.9</strong></td><td class="num"><strong>49.0</strong></td><td class="num"><strong>62.2</strong></td><td class="num"><strong>66.7</strong></td></tr>
+              <tr><td>LoRA</td><td class="num">20.8 %</td><td class="num">74.5</td><td class="num">42.0</td><td class="num">57.3</td><td class="num">57.9</td><td class="num">86.6</td><td class="num">45.9</td><td class="num">60.7</td><td class="num">64.4</td></tr>
+              <tr class="highlight"><td><strong>Neuron (CritNeT)</strong></td><td class="num"><strong>10.8 %</strong></td><td class="num"><strong>75.9</strong></td><td class="num"><strong>44.2</strong></td><td class="num"><strong>57.6</strong></td><td class="num"><strong>59.2</strong></td><td class="num"><strong>88.7</strong></td><td class="num"><strong>49.4</strong></td><td class="num"><strong>62.0</strong></td><td class="num"><strong>66.7</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="table-caption">
+          <strong>Table 3.</strong> Parameter-efficient fine-tuning results.
+          Neuron-based tuning consistently outperforms standard LoRA at
+          equivalent (or smaller) parameter counts. Bold rows are superior to
+          the corresponding LoRA baseline.
+        </p>
+
+        <p>Two patterns are worth flagging:</p>
+
+        <ul>
+          <li>
+            <strong>Sharper PEFT than LoRA.</strong> At every matched (or
+            smaller) parameter budget, neuron-tuning beats LoRA on average — on
+            both seen and unseen languages, on both model families.
+            Concentrating capacity on neurons that are already critical for the
+            calibration corpus is, empirically, a better inductive bias than
+            letting LoRA spread low-rank updates across every projection.
+          </li>
+          <li>
+            <strong>Resilience to catastrophic forgetting.</strong> At ~10 %
+            budget on Llama-3.1-8B, neuron tuning reaches an
+            <em>unseen-language</em> average of 47.1, versus 44.1 for full FT
+            (which barely beats the 41.4 base model). Restricting updates to
+            language-critical pathways preserves foundational knowledge while
+            still benefiting from supervised data — a strict win over full
+            fine-tuning on out-of-distribution languages.
+          </li>
+        </ul>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ===================================================
+           Conclusion
+           =================================================== -->
+      <section id="conclusion">
+        <p class="section-label">Conclusion</p>
+        <h2>One score, three tools</h2>
+
+        <p>
+          CritNeT is built around one observation:
+          <strong>transformer language models behave like sparse functional
+          systems</strong>, and the few percent of neurons that carry a given
+          behaviour can be identified with one backward pass over a calibration
+          corpus. From that single primitive, three concrete tools fall out:
+        </p>
+
+        <ul>
+          <li>
+            $\mathcal{N}_s = \mathcal{N}_r^q \setminus \mathcal{N}_u^p$ —
+            <strong>isolating safety neurons.</strong> Deactivating ~1.5–1.8 %
+            of parameters drives MultiJail ASR up by 5–17× while leaving
+            ARC-E / MMLU largely intact. Freezing them during benign FT does
+            <em>not</em> defend against fine-tuning attacks — alignment can be
+            routed around.
+          </li>
+          <li>
+            $\mathcal{N}_{\text{all}} = \bigcup_t \mathcal{N}_t$ —
+            <strong>foundational neurons as a sharp PEFT signal.</strong>
+            Tuning only $\mathcal{N}_{\text{all}}$ outperforms LoRA at every
+            matched parameter budget on both seen and unseen languages, and
+            beats full fine-tuning on out-of-distribution languages at ~10 %
+            budget.
+          </li>
+          <li>
+            The underlying
+            $\bigl| w_i^{\top} \nabla_{w_i} \mathcal{L} \bigr|$ score itself —
+            a cheap, model-agnostic per-neuron importance that yields
+            <em>causal</em> claims when paired with deactivation.
+          </li>
+        </ul>
+
+        <p>
+          The toolkit is one self-contained package —
+          <code>CriticalNeuronConfig</code>, <code>NeuronDetector</code>,
+          <code>NeuronStatistician</code>, <code>NeuronDeactivator</code>,
+          <code>get_neuron_model</code>, <code>freeze_neurons</code> — and every
+          workflow consumes the same <code>neuron_indices.json</code> artefact,
+          so detection happens once and can be reused for analysis, ablation,
+          freezing, or sparse PEFT.
+        </p>
+      </section>
+    </main>
+
+    <!-- =====================================================
+         Article footer (resources + citation)
+         ===================================================== -->
+    <footer class="article-footer">
+      <div class="article-footer-inner">
+        <h3>Resources</h3>
+        <ul>
+          <li><strong>GitHub repository.</strong> <a href="https://github.com/iNLP-Lab/critnet" rel="noopener">github.com/iNLP-Lab/critnet</a></li>
+          <li><strong>Paper / preprint.</strong> <a href="https://github.com/iNLP-Lab/critnet/blob/main/CritNeT_Latex/CritNeT__A_Critical_Neurons_Toolkit.pdf" rel="noopener">CritNeT__A_Critical_Neurons_Toolkit.pdf</a>. <em>TODO: arXiv link once posted.</em></li>
+          <li><strong>API reference.</strong> <a href="https://github.com/iNLP-Lab/critnet/blob/main/critnet/README.md" rel="noopener"><code>critnet/README.md</code></a></li>
+          <li><strong>Quickstart script.</strong> <a href="https://github.com/iNLP-Lab/critnet/blob/main/quickstart_safety_neurons.py" rel="noopener"><code>quickstart_safety_neurons.py</code></a></li>
+          <li><strong>Experiments.</strong> <a href="https://github.com/iNLP-Lab/critnet/tree/main/lima_s1_exp" rel="noopener"><code>lima_s1_exp/</code></a> — five end-to-end paper experiments.</li>
+          <li><strong>Calibration datasets.</strong>
+            <a href="https://huggingface.co/datasets/iNLP-Lab/multilingual-lima" rel="noopener">multilingual-lima</a>,
+            <a href="https://huggingface.co/datasets/iNLP-Lab/multilingual-s1" rel="noopener">multilingual-s1</a>,
+            <a href="https://huggingface.co/datasets/iNLP-Lab/multilingual-safety" rel="noopener">multilingual-safety</a>.
+          </li>
+        </ul>
+
+        <h3 style="margin-top:48px">Cite this post</h3>
+        <pre class="citation"><code>@misc{hoang2026critnet,
+  title  = {CritNeT: A Critical Neurons Toolkit},
+  author = {Hoang, Long P.},
+  year   = {2026},
+  note   = {Blog post},
+  url    = {https://github.com/iNLP-Lab/critnet}
+}</code></pre>
+
+        <p style="color:var(--color-text-muted); font-size:14px">
+          If you use the toolkit, contributions, issues, and feedback are very welcome —
+          especially benchmarks on architectures and tasks outside the LLaMA /
+          Mistral / Qwen / English-Chinese-Arabic-Swahili setups the paper
+          focuses on.
+        </p>
+      </div>
+    </footer>
+
+    <!-- =====================================================
+         Site footer
+         ===================================================== -->
+    <footer class="site-footer">
+      <p>© 2026 Long P. Hoang · Built with vanilla HTML, KaTeX, and Prism.js · <a href="#top">Back to top ↑</a></p>
+    </footer>
+  </div>
+
+  <!-- =====================================================
+       Scripts
+       ===================================================== -->
+  <!-- KaTeX -->
+  <script
+    defer
+    src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"
+    integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8"
+    crossorigin="anonymous"
+  ></script>
+  <script
+    defer
+    src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    integrity="sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05"
+    crossorigin="anonymous"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '\\(', right: '\\)', display: false },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '$',  right: '$',  display: false }
+      ],
+      throwOnError: false,
+      strict: 'ignore'
+    });"
+  ></script>
+
+  <!-- Prism.js -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+
+  <!-- TOC active highlighting + smooth scroll -->
+  <script>
+    (function () {
+      const tocLinks = Array.from(document.querySelectorAll('.toc a'));
+      const targets = tocLinks
+        .map((a) => document.querySelector(a.getAttribute('href')))
+        .filter(Boolean);
+
+      if (!targets.length) return;
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              tocLinks.forEach((link) => link.classList.remove('active'));
+              const id = entry.target.getAttribute('id');
+              const active = tocLinks.find(
+                (a) => a.getAttribute('href') === '#' + id
+              );
+              if (active) active.classList.add('active');
+            }
+          });
+        },
+        { rootMargin: '-30% 0px -65% 0px', threshold: 0 }
+      );
+
+      targets.forEach((t) => observer.observe(t));
+    })();
+  </script>
+</body>
+</html>
