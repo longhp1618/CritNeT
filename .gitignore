@@ -34,3 +34,6 @@ wandb/
 .idea/
 
 lima_s1_exp/*
+CritNeT_Latex/*
+required_datasets/*
+quickstart_safety_neurons.py

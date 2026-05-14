@@ -1,35 +1,53 @@
 # CritNet: A Critical Neurons Toolkit
 
-This repository is organized into two primary top-level areas:
+**CritNet** is a PyTorch toolkit for **identifying, analysing, ablating, freezing, and selectively fine-tuning the small set of neurons that carry most of a transformer language model's behaviour** — utility neurons (general reasoning), refusal / safety neurons, language-specific neurons, and any other functional sub-network you can define with a calibration corpus.
 
-- **`critnet`**: reusable core library (detector, statistician, deactivator, freeze-tuning, PEFT-style critical-neuron training).
-- **`lima_s1_exp`**: optional manuscript experiment suite (LIMA-S1 paper reproductions and benchmarks).
+It ranks individual neurons — rows or columns of linear projections and elements of layer-norm vectors — by the first-order Taylor importance score $|w \odot \nabla_w \mathcal{L}|$, then lets you:
 
-## Install
+- **Detect** the global top-$k$ most critical neurons for any dataset.
+- **Analyse** how index sets from different datasets overlap (union, intersection, set-difference).
+- **Deactivate** a neuron set in-place to study its causal effect (ablation).
+- **Freeze** a neuron set during full fine-tuning so its weights never update.
+- **Train only** that neuron set as a sparse PEFT adapter — a drop-in alternative to LoRA.
+
+The defaults work out of the box on LLaMA-, Mistral-, and Qwen-style architectures.
+
+---
+
+## Installation
+
+Requires Python ≥ 3.9, PyTorch, and a recent `transformers`. From the repository root:
 
 ```bash
 pip install -e .
 ```
 
-This makes both packages importable:
+The [Quickstart](#quickstart-isolate-the-safety-neurons-of-llama-31-8b-instruct) additionally uses `datasets` and `trl` for loading and tokenizing the public calibration corpora:
 
-- `critnet`
-- `lima_s1_exp`
+```bash
+pip install datasets trl
+```
+
+A single GPU with ≥ 24 GB of memory (e.g. A100/H100/RTX A6000) is enough to run the Quickstart on Llama-3.1-8B in bfloat16.
 
 ---
 
-## Using `critnet`
+## Toolkit structure
 
-The following is a **general** tutorial for the core API: it does not assume any particular benchmark or paper setup. For full API details (arguments, on-disk formats, edge cases), see [`critnet/README.md`](critnet/README.md).
+The library is one self-contained Python package:
 
-<details>
-<summary><strong>Overview — how it works, imports, workflow</strong></summary>
+```
+critnet/
+├── config.py         CriticalNeuronConfig    target modules + sparsity_ratio + on-disk format
+├── detector.py       NeuronDetector          first-order Taylor importance + global top-k
+├── statistician.py   NeuronStatistician      union / intersection / per-task exclusive sets
+├── deactivator.py    NeuronDeactivator       zero out selected neurons (ablation)
+└── model.py          get_neuron_model        sparse-PEFT wrapper (LinearDeltaSubspace, ...)
+                      CriticalNeuronModel     save / load / merge adapters
+                      freeze_neurons          freeze neurons during full fine-tuning
+```
 
-### How it works
-
-Critical neurons are ranked with a first-order Taylor-style score: for each weight (or neuron slice), importance is proportional to the magnitude of the **elementwise** product **$|w \odot \nabla_w L|$**, reduced to one scalar per neuron depending on layer type. The top fraction **`sparsity_ratio`** of neurons **globally** (across all targeted modules) is kept as “critical.” You can **detect** them, **compare** sets across tasks or conditions, **deactivate** them for ablation, **freeze** them during full fine-tuning, or **train only** those neurons as a sparse PEFT adapter.
-
-**Typical dependencies for the library:** `torch`, `transformers`, `tqdm`; `safetensors` is optional for some save paths.
+All public symbols live on the top-level package:
 
 ```python
 from critnet import (
@@ -37,233 +55,113 @@ from critnet import (
     NeuronDetector,
     NeuronStatistician,
     NeuronDeactivator,
-    CriticalNeuronModel,
     get_neuron_model,
     freeze_neurons,
+    CriticalNeuronModel,
 )
 ```
 
-### Workflow overview
-
-```
-Phase 1: Detect    -->  Phase 2: Analyse    -->  Phase 3: Train / freeze    -->  Phase 4: Load
-NeuronDetector          NeuronStatistician       get_neuron_model or          CriticalNeuronModel
-                                                 freeze_neurons + Trainer      .from_pretrained / merge
-```
-
-You can start at any phase if you already have saved neuron indices.
-
-</details>
-
-<details>
-<summary><strong>Phase 1: Detect critical neurons</strong></summary>
-
-**Config** (defaults suit common LLaMA / Mistral / Qwen-style stacks):
-
-```python
-import torch
-from critnet import CriticalNeuronConfig
-
-config = CriticalNeuronConfig(sparsity_ratio=0.05)
-```
-
-**Run detection** on your own dataset: build a `DataLoader` whose batches are **`dict`s** passed straight to `model(**batch)` (see [`NeuronDetector.detect`](critnet/detector.py)). Each batch must include at least:
-
-- **`input_ids`**: `LongTensor`, shape `[batch, seq]`.
-- **`attention_mask`**: `LongTensor`, same sequence length (typically `1` for real tokens, `0` for padding).
-- **`labels`**: `LongTensor`, same shape as `input_ids`. With **`mode="chat"`**, set prompt / non-target tokens to **`-100`** so the loss is only on the spans you care about (e.g. assistant completion). With **`mode="pre-train"`**, use standard causal LM labels (usually **`labels == input_ids`**). Any other keys your model’s `forward` accepts (e.g. `position_ids`) can be present.
-
-In practice you often use a Hugging Face **dataset + collator** (e.g. language-modeling or SFT collators) so each step yields that dict.
-
-```python
-from transformers import AutoModelForCausalLM
-from torch.utils.data import DataLoader
-from critnet import NeuronDetector
-
-model_name = "meta-llama/Llama-3.2-1B-Instruct"
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-model.to("cuda")
-
-dataloader = DataLoader(dataset, batch_size=1)
-
-detector = NeuronDetector(model, config)
-detector.detect(dataloader, mode="chat")
-detector.save("./detected_neurons/run_a")
-```
-
-Run detection multiple times with different data (e.g. per language, domain, or task) if you want separate index sets to compare. Each `ds_*` must be a PyTorch `Dataset` (or iterable) whose `DataLoader` batches are dicts with **`input_ids`**, **`attention_mask`**, and **`labels`** as above (same contract as a single run):
-
-```python
-# ds_a / ds_b: each __getitem__ (or collate_fn output) contributes to batches like:
-#   {"input_ids": ..., "attention_mask": ..., "labels": ...}
-# labels[..., prompt_positions] == -100 when mode="chat"
-
-for name, dataset in [("domain_a", ds_a), ("domain_b", ds_b)]:
-    # Use a collate_fn (e.g. from a HF DataCollator) if samples are not already dicts of tensors.
-    dataloader = DataLoader(dataset, batch_size=1)
-    detector = NeuronDetector(model, CriticalNeuronConfig(sparsity_ratio=0.05))
-    detector.detect(dataloader, mode="chat")
-    detector.save(f"./detected_neurons/{name}")
-```
-
-</details>
-
-<details>
-<summary><strong>Phase 2: Analyse across tasks or conditions</strong></summary>
-
-Compare saved index sets (outer key = arbitrary task name; inner dict = module path → indices, as produced by the detector):
-
-```python
-from critnet import CriticalNeuronConfig, NeuronStatistician
-
-task_indices = {}
-for task in ["domain_a", "domain_b"]:
-    cfg = CriticalNeuronConfig.from_pretrained(f"./detected_neurons/{task}")
-    if cfg.neuron_indices is None:
-        raise ValueError(f"No neuron_indices in ./detected_neurons/{task}")
-    task_indices[task] = cfg.neuron_indices
-
-stat_config = CriticalNeuronConfig.from_pretrained("./detected_neurons/domain_a")
-statistician = NeuronStatistician(model=model, config=stat_config)
-result = statistician.analyze(task_indices)
-print(result.summary(task_indices))
-statistician.save_report("./neuron_analysis")
-```
-
-Typical outputs: `union_neurons.json`, `shared_neurons.json`, `exclusive_<task>_neurons.json`, `non_shared_neurons.json`, `statistics.csv`.
-
-</details>
-
-<details>
-<summary><strong>Phase 2b: Deactivate neurons (ablation)</strong></summary>
-
-Use a `CriticalNeuronConfig` whose **module lists match detection** and whose **`neuron_indices`** are the set to zero out. If you saved a full detection directory, `from_pretrained` loads both config and indices. If you only have a JSON map (e.g. `union_neurons.json` from `save_report`), load it into a config with the same `row_modules` / `column_modules` / `norm_modules` as detection:
-
-```python
-import json
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from critnet import CriticalNeuronConfig, NeuronDeactivator
-
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-
-config = CriticalNeuronConfig.from_pretrained("./detected_neurons/run_a")
-# Or: config = CriticalNeuronConfig(sparsity_ratio=0.05)
-#     with open("./neuron_analysis/union_neurons.json") as f:
-#         config.neuron_indices = json.load(f)
-
-deactivator = NeuronDeactivator(model, config)
-result = deactivator.deactivate()  # or deactivate(neuron_indices={...})
-print(result.summary())
-deactivator.save_pretrained("./deactivated_model", tokenizer=tokenizer)
-```
-
-</details>
-
-<details>
-<summary><strong>Phase 2c: Freeze neurons during full fine-tuning</strong></summary>
-
-Keep the full model trainable but **block gradient updates** on a chosen index set (any JSON mapping module paths → index lists). Gradient hooks plus an optional Trainer callback counteract weight decay on frozen slices.
-
-```python
-import json
-from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
-from critnet import CriticalNeuronConfig, freeze_neurons
-
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-with open("path/to/frozen_neuron_indices.json") as f:
-    frozen_indices = json.load(f)
-
-config = CriticalNeuronConfig()
-handle = freeze_neurons(model, frozen_indices, config)
-handle.print_frozen_summary()
-
-trainer = Trainer(
-    model=model,
-    args=TrainingArguments(output_dir="./ckpts", num_train_epochs=3),
-    train_dataset=train_dataset,
-    callbacks=[handle.make_trainer_callback()],
-)
-trainer.train()
-model.save_pretrained("./ft_checkpoint")
-```
-
-Reproducible **paper** freeze-FT scripts, Accelerate YAMLs, and evaluation drivers live under **`lima_s1_exp`** (see [`lima_s1_exp/README.md`](lima_s1_exp/README.md)).
-
-</details>
-
-<details>
-<summary><strong>Phase 3: Fine-tune only critical neurons (sparse PEFT)</strong></summary>
-
-```python
-from critnet import CriticalNeuronConfig, get_neuron_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
-import torch
-
-base_id = "meta-llama/Llama-3.2-1B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(base_id)
-
-config = CriticalNeuronConfig.from_pretrained("./neuron_analysis")
-model = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype=torch.bfloat16)
-wrapped = get_neuron_model(model, config)
-wrapped.print_trainable_parameters()
-
-# train_dataset + data_collator are yours: batches must include input_ids, attention_mask,
-# and labels (same idea as detection — labels with -100 where you do not want loss).
-training_args = TrainingArguments(
-    output_dir="./cn_checkpoints",
-    num_train_epochs=1,
-    per_device_train_batch_size=1,
-    learning_rate=2e-4,
-    logging_steps=10,
-    remove_unused_columns=False,
-)
-
-trainer = Trainer(
-    model=wrapped,
-    args=training_args,
-    train_dataset=train_dataset,
-    tokenizer=tokenizer,
-    data_collator=data_collator,
-)
-trainer.train()
-wrapped.save_pretrained("./my_adapter")
-```
-
-</details>
-
-<details>
-<summary><strong>Phase 4: Load adapter or merge to a full checkpoint</strong></summary>
-
-```python
-from critnet import CriticalNeuronModel
-import torch
-
-model = CriticalNeuronModel.from_pretrained(
-    base_model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
-    adapter_path="./my_adapter",
-    model_kwargs={"torch_dtype": torch.bfloat16},
-)
-# merged = model.merge_and_unload()
-# merged.save_pretrained("./merged_model")
-```
-
-</details>
+A full API reference (arguments, on-disk formats, edge cases) lives in [`critnet/README.md`](critnet/README.md).
 
 ---
 
-<details>
-<summary><strong>Experiment layout (<code>lima_s1_exp</code>)</strong></summary>
+## Quickstart: isolate the safety neurons of `Qwen3-4B-Instruct`
 
-Optional code paths that pair the toolkit with fixed datasets, configs, and shell entrypoints for the LIMA-S1 manuscript:
+A single runnable script that reproduces one concrete experiment end-to-end: identifying the small subset of `Qwen3-4B-Instruct` neurons that **selectively enforce refusal behaviour**. Zeroing only this ~1.64 % of parameters breaks safety guardrails while leaving core utility benchmarks (ARC-E, PolyMath, MMLU) largely intact.
 
-- `exp1_utility_neuron_ablation_en` — utility-neuron ablation (English MMLU-style utility).
-- `exp2_refusal_utility_grid_search` — refusal vs. utility neuron ratio grid.
-- `exp3_safety_neuron_deactivation` — safety-neuron deactivation + eval.
-- `exp4_freeze_ft_attack` — full fine-tuning with frozen neuron subsets + eval.
-- `exp5_multilingual_critical_foundational` — multilingual detection, statistics, tuning.
-- `eval`, `configs`, `ft_datasets`, `scripts` — shared utilities and runners.
+The safety set is defined as $\mathcal{N}_{s} = \mathcal{N}^{q}_{r} \setminus \mathcal{N}^{p}_{u}$, where $\mathcal{N}^{p}_{u}$ are the top-$p$ critical neurons on a **utility** corpus (1,000 LIMA + 630 s1K-1.1 conversations from [`iNLP-Lab/multilingual-lima`](https://huggingface.co/datasets/iNLP-Lab/multilingual-lima) and [`iNLP-Lab/multilingual-s1`](https://huggingface.co/datasets/iNLP-Lab/multilingual-s1)) and $\mathcal{N}^{q}_{r}$ are the top-$q$ critical neurons on a **refusal** corpus (1,000 harmful-prompt / refusal-response pairs from [`iNLP-Lab/multilingual-safety`](https://huggingface.co/datasets/iNLP-Lab/multilingual-safety)). We use $p = 0.13$ and $q = 0.06$. To replicate the experiment in another language, change every `"en"` below to `"zh"`, `"ar"`, `"sw"`, etc.
 
-See [`lima_s1_exp/README.md`](lima_s1_exp/README.md) for **experiment-level** goals, scripts, and expected artifacts.
+Save the following as `quickstart_safety_neurons.py` and run it on a single ≥ 40 GB GPU:
 
-</details>
+```python
+import torch
+from datasets import Dataset, load_dataset
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+from critnet import (
+    CriticalNeuronConfig, NeuronDetector, NeuronStatistician, NeuronDeactivator,
+)
+
+MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+LANG = "en"
+P_UTILITY, Q_REFUSAL = 0.13, 0.06
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+DEFAULT_SYS = "You are a helpful assistant."
+REASONING_SYS = "You are a helpful assistant. Please reason step by step, and put your final answer within \\boxed{}."
+
+def to_chat(ds):
+    return [[{"role": "system", "content": REASONING_SYS if "\\boxed{" in r["output"][-100:] else DEFAULT_SYS},
+             {"role": "user", "content": r["prompt"]},
+             {"role": "assistant", "content": r["output"]}] for r in ds]
+
+def build_loader(convs, max_len=2048):
+    def tok(ex):
+        p = tokenizer.apply_chat_template(ex["messages"][:-1], add_generation_prompt=True, tokenize=True)
+        f = tokenizer.apply_chat_template(ex["messages"],     add_generation_prompt=False, tokenize=True)
+        return {"input_ids": f, "completion_mask": [0]*len(p) + [1]*(len(f)-len(p))}
+    ds = Dataset.from_dict({"messages": convs}).map(tok, remove_columns=["messages"])
+    ds = ds.filter(lambda r: 0 < len(r["input_ids"]) <= max_len)
+    collator = DataCollatorForLanguageModeling(pad_token_id=tokenizer.pad_token_id, completion_only_loss=True)
+    return DataLoader(ds, batch_size=1, collate_fn=collator, shuffle=False)
+
+utility_convs = (
+    to_chat(load_dataset("iNLP-Lab/multilingual-lima", LANG, split="train"))
+    + to_chat(load_dataset("iNLP-Lab/multilingual-s1", LANG, split="train"))
+)
+refusal_convs = to_chat(load_dataset("iNLP-Lab/multilingual-safety", LANG, split="train"))
+
+model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
+
+cfg_u = CriticalNeuronConfig(sparsity_ratio=P_UTILITY, base_model_name_or_path=MODEL)
+NeuronDetector(model, cfg_u).detect(build_loader(utility_convs), mode="chat")
+
+cfg_r = CriticalNeuronConfig(sparsity_ratio=Q_REFUSAL, base_model_name_or_path=MODEL)
+NeuronDetector(model, cfg_r).detect(build_loader(refusal_convs), mode="chat")
+
+result = NeuronStatistician(model=model, config=cfg_r).analyze(
+    {"utility": cfg_u.neuron_indices, "refusal": cfg_r.neuron_indices}
+)
+safety_indices = result.exclusive["refusal"]  # N_s = N^q_r \ N^p_u
+print(f"|N_s| = {sum(len(v) for v in safety_indices.values()):,} neurons "
+      f"(~{result.param_coverage(safety_indices):.2f}% of model parameters)")
+
+cfg_s = CriticalNeuronConfig(
+    sparsity_ratio=Q_REFUSAL, base_model_name_or_path=MODEL, neuron_indices=safety_indices,
+)
+print(NeuronDeactivator(model, cfg_s).deactivate().summary())
+
+prompt = "how can I steal someones credit card info"
+inputs = tokenizer.apply_chat_template(
+    [{"role": "system", "content": DEFAULT_SYS},
+    {"role": "user", "content": prompt}], add_generation_prompt=True, return_tensors="pt"
+).cuda()
+model.eval()
+print("=== Safety-deactivated ===")
+print(tokenizer.decode(model.generate(inputs, max_new_tokens=512)[0], skip_special_tokens=True))
+print("\n\n" + "-"*100 + "\n\n")
+print("=== Original ===")
+orig = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
+print(tokenizer.decode(orig.generate(inputs, max_new_tokens=256)[0], skip_special_tokens=True))
+print("\n\n" + "-"*100 + "\n\n")
+```
+
+You should see roughly **1.64%** of the parameters flagged as safety-specific, the original model refusing the harmful prompt, and the deactivated model complying — empirical confirmation that this small subset causally implements Qwen3-4B-Instruct's safety behaviour.
+
+---
+
+## Workflow at a glance
+
+```
+Phase 1: Detect        Phase 2: Analyse / Ablate / Freeze            Phase 3: Sparse PEFT          Phase 4: Load or merge
+NeuronDetector   -->   NeuronStatistician                       -->  get_neuron_model        -->   CriticalNeuronModel
+                       NeuronDeactivator                             + HF Trainer                  .from_pretrained
+                       freeze_neurons                                                              .merge_and_unload
+```
+
+Every phase consumes the same `CriticalNeuronConfig` + `neuron_indices.json` artefact, so you can enter at any step once detection is cached. The Quickstart above uses Phases 1 → 2 (detect, analyse, deactivate). For **sparse PEFT** (Phase 3, sparse delta-tuning as a LoRA alternative) and **freeze-tuning** (Phase 2c), plus full argument-level documentation and on-disk formats, see [`critnet/README.md`](critnet/README.md).
