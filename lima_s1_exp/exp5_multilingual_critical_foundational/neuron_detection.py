@@ -28,14 +28,6 @@ def _merge_unique(base: Optional[List[str]], extra: List[str]) -> List[str]:
     return merged
 
 
-def _detect_mode(user_mode: str, samples: List) -> str:
-    if user_mode != "auto":
-        return user_mode
-    if not samples:
-        return "chat"
-    return "chat" if isinstance(samples[0], (list, tuple)) else "pre-train"
-
-
 def _summary(indices: Dict[str, List[int]]) -> Dict[str, int]:
     by_module = {}
     total = 0
@@ -75,7 +67,6 @@ def main() -> None:
         help="Global top-k ratio, or comma-separated ratios (e.g. 0.001,0.01,0.05) to select and save for each.",
     )
     parser.add_argument("--max_samples", type=int, default=-1, help="Max samples per language")
-    parser.add_argument("--mode", choices=["auto", "chat", "pre-train"], default="auto")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_length", type=int, default=2048)
 
@@ -212,7 +203,6 @@ def main() -> None:
                         tokenizer = define_chat_template_base(tokenizer, lang)
 
                     samples = text_dct[lang]
-                    run_mode = _detect_mode(args.mode, samples)
                     dataloader = create_dataloader(
                         raw=samples,
                         tokenizer=tokenizer,
@@ -221,7 +211,7 @@ def main() -> None:
                         shuffle=False,
                     )
 
-                    print(f"\nDetecting neurons for {lang} (mode={run_mode}, samples={len(samples)})...")
+                    print(f"\nDetecting neurons for {lang} (samples={len(samples)})...")
                     detector = NeuronDetector(model=model, config=config)
                     cache_path = None
                     if multi_ratio:
@@ -230,7 +220,6 @@ def main() -> None:
                         cache_path = str(importance_save_root / args.base / args.stype / f"{lang}.pt")
                     selected = detector.detect(
                         dataloader=dataloader,
-                        mode=run_mode,
                         save_importance_cache_path=cache_path,
                     )
                 else:

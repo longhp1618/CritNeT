@@ -253,7 +253,7 @@ config = CriticalNeuronConfig(
     sparsity_ratio=0.05,                       # keep the top 5% of pooled neurons
     base_model_name_or_path=MODEL,
 )
-NeuronDetector(model, config).detect(calibration_loader, mode="chat")
+NeuronDetector(model, config).detect(calibration_loader)
 config.save_pretrained("./neurons")            # writes neuron_indices.json
 </code></pre>
 
@@ -267,9 +267,11 @@ config.save_pretrained("./neurons")            # writes neuron_indices.json
           <code>q_norm</code>, <code>k_norm</code> to
           <code>norm_modules</code>. Each batch yielded by
           <code>calibration_loader</code> must contain <code>input_ids</code>,
-          <code>attention_mask</code>, and <code>labels</code> (with prompt
-          tokens masked to <code>-100</code> in <code>"chat"</code> mode so only
-          completion tokens contribute to the loss).
+          <code>attention_mask</code>, and <code>labels</code>. For chat SFT
+          calibration, prompt tokens should be masked to <code>-100</code> by
+          your collator so only completion tokens contribute to the loss;
+          for pre-training calibration, set <code>labels</code> equal to
+          <code>input_ids</code>.
         </p>
       </section>
 
@@ -368,10 +370,10 @@ config.save_pretrained("./neurons")            # writes neuron_indices.json
 
 # 1. Detect utility-critical and refusal-critical sets.
 cfg_u = CriticalNeuronConfig(sparsity_ratio=0.13, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_u).detect(utility_loader, mode="chat")
+NeuronDetector(model, cfg_u).detect(utility_loader)
 
 cfg_r = CriticalNeuronConfig(sparsity_ratio=0.06, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_r).detect(refusal_loader, mode="chat")
+NeuronDetector(model, cfg_r).detect(refusal_loader)
 
 # 2. Isolate safety neurons by set difference: N_s = N_r \ N_u.
 result = NeuronStatistician(model=model, config=cfg_r).analyze({
@@ -382,10 +384,7 @@ safety_indices = result.exclusive["refusal"]
 print(f"|N_s| ~ {result.param_coverage(safety_indices):.2f}% of model params")
 
 # 3. Deactivate the safety neurons in place.
-cfg_s = CriticalNeuronConfig(
-    sparsity_ratio=0.06, base_model_name_or_path=MODEL,
-    neuron_indices=safety_indices,
-)
+cfg_s = CriticalNeuronConfig(base_model_name_or_path=MODEL, neuron_indices=safety_indices)
 NeuronDeactivator(model, cfg_s).deactivate()
 </code></pre>
 
@@ -459,13 +458,13 @@ NeuronDeactivator(model, cfg_s).deactivate()
 
 <pre><code class="language-python">import json
 from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
-from critnet import CriticalNeuronConfig, freeze_neurons
+from critnet import freeze_neurons
 
 model = AutoModelForCausalLM.from_pretrained(MODEL)
 with open("./neurons/safety_indices.json") as f:
     safety_indices = json.load(f)
 
-handle = freeze_neurons(model, safety_indices, config=CriticalNeuronConfig())
+handle = freeze_neurons(model, safety_indices)
 handle.print_frozen_summary()
 
 trainer = Trainer(
@@ -620,7 +619,7 @@ model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).
 lang_indices = {}
 for lang, loader in lang_loaders.items():           # en, zh, ar, sw
     cfg = CriticalNeuronConfig(sparsity_ratio=0.05, base_model_name_or_path=MODEL)
-    NeuronDetector(model, cfg).detect(loader, mode="chat")
+    NeuronDetector(model, cfg).detect(loader)
     lang_indices[lang] = cfg.neuron_indices
 
 # 2. Foundational set N_all = union of per-language sets.
@@ -641,8 +640,9 @@ Trainer(model=wrapped,
         train_dataset=train_dataset).train()
 wrapped.save_pretrained("./my_adapter")
 
+# base_model_name_or_path is recovered from ./my_adapter/critical_neuron_config.json.
 merged = CriticalNeuronModel.from_pretrained(
-    MODEL, "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
+    "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
 )
 plain = merged.merge_and_unload()                   # plain nn.Module, ready to ship
 plain.save_pretrained("./my_merged_model")

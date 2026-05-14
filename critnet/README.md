@@ -93,7 +93,7 @@ Result: gate and up rows are always selected as a pair.
 
 `NeuronDetector.detect` calls `model.zero_grad()` **once** at the start, then loops `loss.backward()` per batch **without zeroing between batches**. The importance step uses these accumulated gradients, which is mathematically equivalent to computing the gradient of the summed loss over the whole calibration corpus.
 
-The `mode` argument (`"chat"` vs `"pre-train"`) is purely documentation — it does **not** mask labels for you. Your dataset / collator must set `labels` to `-100` on prompt positions (for `"chat"`) or to `input_ids` (for `"pre-train"`).
+Label masking is **not** done by `detect`. Your dataset / collator is responsible for producing the right `labels`: set them to `-100` on prompt positions for chat SFT (so only completion tokens contribute to the loss), or equal to `input_ids` for pre-training (next-token prediction on every token).
 
 ---
 
@@ -162,14 +162,13 @@ NeuronDetector(model: nn.Module | None, config: CriticalNeuronConfig)
 
 - `model` is required for `.detect(...)`. It is **optional** when you only call `.select_from_importance_cache(...)` on a previously saved scores blob.
 
-### `detect(dataloader, mode="chat", save_importance_cache_path=None)`
+### `detect(dataloader, save_importance_cache_path=None)`
 
 Runs the calibration pass and returns `dict[module_path, sorted list[int]]`. Also stores the result on `self.config.neuron_indices` so you can immediately `config.save_pretrained(...)`.
 
 | Argument | Description |
 |----------|-------------|
-| `dataloader` | Each batch must be a `dict` containing at least `input_ids`, `attention_mask`, and `labels`. |
-| `mode` | `"chat"` or `"pre-train"`. Documentation only — see [Gradients accumulate inside `detect`](#gradients-accumulate-inside-detect). |
+| `dataloader` | Each batch must be a `dict` containing at least `input_ids`, `attention_mask`, and `labels`. See [Gradients accumulate inside `detect`](#gradients-accumulate-inside-detect) for how `labels` should be prepared by your dataset / collator. |
 | `save_importance_cache_path` | If set, saves the **post–gate-combined** per-module score tensors so you can re-select with a different `sparsity_ratio` without rerunning the backward pass. |
 
 ### `save(save_path)`
@@ -346,7 +345,7 @@ Thin `nn.Module` around the wrapped inner model. Compatible with `transformers.T
 | `forward`, `generate` | Delegated to `model`. |
 | `get_adapter_state_dict()` | OrderedDict of `*.dW` and `*.idx` from every delta module. |
 | `save_pretrained(save_directory, **kwargs)` | Writes the adapter + config JSONs (see on-disk layout). |
-| `from_pretrained(base_model_name_or_path, adapter_path, model_kwargs=None, modules_to_skip=None)` | Class method. Loads the base model, calls `get_neuron_model`, then loads `dW` from the adapter file. |
+| `from_pretrained(adapter_path, base_model_name_or_path=None, model_kwargs=None, modules_to_skip=None)` | Class method. Loads the base model, calls `get_neuron_model`, then loads `dW` from the adapter file. `base_model_name_or_path` falls back to the value recorded in `adapter_path/critical_neuron_config.json` when omitted. |
 | `merge_and_unload()` | In-place merge of every delta wrapper; returns the inner plain `nn.Module`. |
 | `print_trainable_parameters()` | Prints trainable / total parameter counts. |
 
@@ -471,7 +470,7 @@ config = CriticalNeuronConfig(
     norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],  # Qwen-3
     base_model_name_or_path=MODEL,
 )
-NeuronDetector(model, config).detect(calibration_loader, mode="chat")
+NeuronDetector(model, config).detect(calibration_loader)
 config.save_pretrained("./neurons")
 del model
 
@@ -489,8 +488,10 @@ Trainer(
 wrapped.save_pretrained("./my_adapter")
 
 # 3. Reload + merge into a vanilla HF checkpoint
+#    (base_model_name_or_path is read from ./my_adapter/critical_neuron_config.json
+#     because we set it on `config` during step 1.)
 merged = CriticalNeuronModel.from_pretrained(
-    MODEL, "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
+    "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
 )
 plain = merged.merge_and_unload()
 plain.save_pretrained("./my_merged_model")
@@ -501,20 +502,18 @@ plain.save_pretrained("./my_merged_model")
 ```python
 import json
 from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
-from critnet import CriticalNeuronConfig, freeze_neurons
+from critnet import freeze_neurons
 
 MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 model = AutoModelForCausalLM.from_pretrained(MODEL)
 with open("./neurons/safety_indices.json") as f:
     safety_indices = json.load(f)
 
-handle = freeze_neurons(
-    model,
-    safety_indices,
-    config=CriticalNeuronConfig(
-        norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],
-    ),
-)
+# `config` is optional: freeze_neurons falls back to a duck-typed norm
+# check for module paths the default config does not enumerate, so
+# Qwen-3 `q_norm` / `k_norm` entries in `safety_indices` are recognised
+# automatically.
+handle = freeze_neurons(model, safety_indices)
 handle.print_frozen_summary()
 
 trainer = Trainer(
@@ -542,10 +541,10 @@ cfg = CriticalNeuronConfig(
     base_model_name_or_path=MODEL,
 )
 det = NeuronDetector(model, cfg)
-det.detect(loader, mode="chat", save_importance_cache_path="./cache.pt")  # expensive once
+det.detect(loader, save_importance_cache_path="./cache.pt")  # expensive once
 
 for r in [0.01, 0.02, 0.05, 0.10, 0.20]:
     cfg.sparsity_ratio = r
-    det.select_from_importance_cache("./cache.pt")                         # cheap
+    det.select_from_importance_cache("./cache.pt")           # cheap
     cfg.save_pretrained(f"./neurons/r{r}")
 ```

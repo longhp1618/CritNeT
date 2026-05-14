@@ -658,8 +658,8 @@ class CriticalNeuronModel(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        base_model_name_or_path: str,
         adapter_path: str,
+        base_model_name_or_path: Optional[str] = None,
         model_kwargs: Optional[Dict[str, Any]] = None,
         modules_to_skip: Optional[Set[str]] = None,
     ) -> "CriticalNeuronModel":
@@ -667,11 +667,13 @@ class CriticalNeuronModel(nn.Module):
 
         Parameters
         ----------
-        base_model_name_or_path : str
-            HuggingFace model id or local path.
         adapter_path : str
             Directory containing the adapter files (``adapter_model.*``,
             ``critical_neuron_config.json``, ``neuron_indices.json``).
+        base_model_name_or_path : str, optional
+            HuggingFace model id or local path.  If ``None``, falls back
+            to the ``base_model_name_or_path`` recorded inside
+            ``adapter_path/critical_neuron_config.json``.
         model_kwargs : dict, optional
             Extra keyword arguments forwarded to
             ``AutoModelForCausalLM.from_pretrained`` (e.g.
@@ -686,6 +688,13 @@ class CriticalNeuronModel(nn.Module):
         from transformers import AutoModelForCausalLM
 
         config = CriticalNeuronConfig.from_pretrained(adapter_path)
+        if base_model_name_or_path is None:
+            base_model_name_or_path = config.base_model_name_or_path
+        if not base_model_name_or_path:
+            raise ValueError(
+                "base_model_name_or_path was not provided and is not recorded in "
+                f"{adapter_path}/critical_neuron_config.json. Pass it explicitly."
+            )
         config.base_model_name_or_path = base_model_name_or_path
 
         model = AutoModelForCausalLM.from_pretrained(

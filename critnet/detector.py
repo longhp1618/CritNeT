@@ -51,7 +51,7 @@ class NeuronDetector:
     -------
     >>> config = CriticalNeuronConfig(sparsity_ratio=0.05)
     >>> detector = NeuronDetector(model, config)
-    >>> indices = detector.detect(dataloader, mode="chat")
+    >>> indices = detector.detect(dataloader)
     >>> detector.save("./detected_neurons")
     """
 
@@ -66,7 +66,6 @@ class NeuronDetector:
     def detect(
         self,
         dataloader: DataLoader,
-        mode: str = "chat",
         save_importance_cache_path: Optional[str] = None,
     ) -> Dict[str, List[int]]:
         """Run importance detection and return neuron indices.
@@ -75,18 +74,13 @@ class NeuronDetector:
         ----------
         dataloader : DataLoader
             Must yield dicts with at least ``input_ids``,
-            ``attention_mask``, and ``labels``.
+            ``attention_mask``, and ``labels``.  The dataset / collator
+            is responsible for preparing ``labels`` appropriately:
 
-            * ``mode="chat"``: ``labels`` should already have prompt
-              tokens masked to ``-100`` (only completion tokens
-              contribute to the loss).
-            * ``mode="pre-train"``: ``labels`` should equal
-              ``input_ids`` (standard next-token prediction on all
-              tokens).
-        mode : str
-            ``"chat"`` or ``"pre-train"``.  Controls how the loss is
-            expected to be prepared -- the actual masking is done
-            upstream in the dataset / collator.
+            * **Chat SFT:** mask prompt tokens to ``-100`` so only
+              completion tokens contribute to the loss.
+            * **Pre-training:** set ``labels`` equal to ``input_ids``
+              (standard next-token prediction on every token).
         save_importance_cache_path : str, optional
             If set, persist the **post–gate-combined** per-module importance
             tensors (CPU floats) plus gate metadata so a later run can call
@@ -99,8 +93,6 @@ class NeuronDetector:
             Mapping from full module path to sorted list of selected
             neuron indices.  Also stored in ``self.config.neuron_indices``.
         """
-        if mode not in ("chat", "pre-train"):
-            raise ValueError(f"mode must be 'chat' or 'pre-train', got '{mode}'")
         if self.model is None:
             raise ValueError("detect() requires a model; use select_from_importance_cache() for cached scores.")
 

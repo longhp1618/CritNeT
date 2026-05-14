@@ -126,10 +126,10 @@ from critnet import (
 model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
 
 cfg_u = CriticalNeuronConfig(sparsity_ratio=P_UTILITY, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_u).detect(build_loader(utility_convs), mode="chat")
+NeuronDetector(model, cfg_u).detect(build_loader(utility_convs))
 
 cfg_r = CriticalNeuronConfig(sparsity_ratio=Q_REFUSAL, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_r).detect(build_loader(refusal_convs), mode="chat")
+NeuronDetector(model, cfg_r).detect(build_loader(refusal_convs))
 
 result = NeuronStatistician(model=model, config=cfg_r).analyze(
     {"utility": cfg_u.neuron_indices, "refusal": cfg_r.neuron_indices}
@@ -138,9 +138,7 @@ safety_indices = result.exclusive["refusal"]  # N_s = N^q_r \ N^p_u
 print(f"|N_s| = {sum(len(v) for v in safety_indices.values()):,} neurons "
       f"(~{result.param_coverage(safety_indices):.2f}% of model parameters)")
 
-cfg_s = CriticalNeuronConfig(
-    sparsity_ratio=Q_REFUSAL, base_model_name_or_path=MODEL, neuron_indices=safety_indices,
-)
+cfg_s = CriticalNeuronConfig(base_model_name_or_path=MODEL, neuron_indices=safety_indices)
 print(NeuronDeactivator(model, cfg_s).deactivate().summary())
 
 prompt = "a harmful question."
