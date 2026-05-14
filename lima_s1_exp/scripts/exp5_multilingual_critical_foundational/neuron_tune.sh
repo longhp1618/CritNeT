@@ -45,7 +45,6 @@ accelerate launch --config_file "${ACC_CONFIG}" \
   --neuron_path "${NEURON_PATH}" \
   --training_config "${TRAINING_CONFIG}" \
   --langs "${LANGS}" \
-  --sparsity_ratio "${RATIO}" \
   "${extra[@]}"
 
 ADAPTER_DIR="saved_adapters/neuron_tuning/${STYPE}/${BASE_MODEL}"

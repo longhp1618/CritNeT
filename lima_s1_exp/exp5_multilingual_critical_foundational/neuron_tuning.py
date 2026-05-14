@@ -14,7 +14,11 @@ import transformers
 from omegaconf import OmegaConf
 from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
 
-from critnet import CriticalNeuronConfig, get_neuron_model
+from critnet import (
+    CriticalNeuronConfig,
+    get_neuron_model,
+    load_neuron_indices,
+)
 from lima_s1_exp.dataloader import build_lm_dataset, collate_fn
 from lima_s1_exp.utils import prepare_tokenizer, process_data
 
@@ -64,15 +68,19 @@ def _merge_unique(base: Optional[List[str]], extra: List[str]) -> List[str]:
     return merged
 
 
-def _load_or_build_config(args: argparse.Namespace) -> CriticalNeuronConfig:
+def _load_config_and_indices(
+    args: argparse.Namespace,
+) -> tuple[CriticalNeuronConfig, Dict[str, List[int]]]:
+    """Load (config, indices) from a toolkit folder or a bare JSON file."""
     neuron_path = Path(args.neuron_path)
     if neuron_path.is_dir() and (neuron_path / "critical_neuron_config.json").is_file():
         cfg = CriticalNeuronConfig.from_pretrained(str(neuron_path))
         cfg.base_model_name_or_path = args.base
-        return cfg
+        indices = load_neuron_indices(str(neuron_path))
+        return cfg, indices
 
     with open(neuron_path, "r", encoding="utf-8") as f:
-        neuron_indices: Dict[str, List[int]] = json.load(f)
+        indices = json.load(f)
 
     row_modules = _parse_modules(args.row_modules)
     col_modules = _parse_modules(args.column_modules)
@@ -81,19 +89,17 @@ def _load_or_build_config(args: argparse.Namespace) -> CriticalNeuronConfig:
 
     if args.include_all_eligible_modules:
         args.include_attention_norms = True
-
     if args.include_attention_norms:
         norm_modules = _merge_unique(norm_modules, ["q_norm", "k_norm"])
 
-    return CriticalNeuronConfig(
+    cfg = CriticalNeuronConfig(
         base_model_name_or_path=args.base,
         row_modules=row_modules,
         column_modules=col_modules,
         norm_modules=norm_modules,
         embedding_modules=emb_modules,
-        sparsity_ratio=args.sparsity_ratio,
-        neuron_indices=neuron_indices,
     )
+    return cfg, indices
 
 
 def _verify_freeze(model) -> None:
@@ -121,8 +127,6 @@ def main() -> None:
     parser.add_argument("--save_merged_model", action="store_true", help="Merge sparse adapter and save full model")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--langs", type=str, default="en,zh,ar,sw", help="Comma-separated languages")
-    parser.add_argument("--sparsity_ratio", type=float, default=0.05)
-
     parser.add_argument("--row_modules", type=str, default=None)
     parser.add_argument("--column_modules", type=str, default=None)
     parser.add_argument("--norm_modules", type=str, default=None)
@@ -136,8 +140,8 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(args.base)
     tokenizer, _ = prepare_tokenizer(args.base)
 
-    config = _load_or_build_config(args)
-    neuron_model = get_neuron_model(model, config)
+    config, indices = _load_config_and_indices(args)
+    neuron_model = get_neuron_model(model, config, indices)
     neuron_model.print_trainable_parameters()
     _verify_freeze(neuron_model)
 

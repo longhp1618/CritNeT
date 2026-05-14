@@ -1,24 +1,24 @@
-"""Configuration for CriticalNeuronToolkit -- a PEFT method based on critical-neuron tuning.
+"""Configuration for :mod:`critnet`.
 
-This module defines :class:`CriticalNeuronConfig`, the central configuration
-object that governs which modules are targeted, how neurons are categorised
-(row / column / norm / embedding), and where detected neuron indices are
-persisted.
+``CriticalNeuronConfig`` describes **which modules** in a transformer language
+model are candidates for critical-neuron detection.  It is a pure
+*architectural* description: there are deliberately no detection-run
+hyperparameters (such as ``sparsity_ratio``) and no post-detection state
+(such as ``neuron_indices``) on the config.  Those belong on
+:class:`~critnet.detector.DetectionResult` instead.
 
 Architectural defaults
 ----------------------
 LLaMA, Mistral, and Qwen model families share an identical module-naming
 convention for their linear projections and layer norms.  When a category
-field is left as ``None``, the config automatically fills it with sensible
-defaults so that users can get started with a single line:
+is left as ``None``, the config automatically fills it with sensible
+defaults so users can get started with one line:
 
->>> config = CriticalNeuronConfig(sparsity_ratio=0.05)
+>>> config = CriticalNeuronConfig()  # full defaults
 
-To customise -- for example to include the LM head or Qwen-3 QK norms --
-simply pass the relevant list explicitly:
+Override only what you need:
 
 >>> config = CriticalNeuronConfig(
-...     row_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"],
 ...     norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],
 ... )
 """
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -42,43 +42,74 @@ DEFAULT_ROW_MODULES: List[str] = [
     "up_proj",
 ]
 """Linear modules whose neurons correspond to **rows** of the weight matrix
-(i.e. output-dimension neurons).  Importance is computed as
-``|W[i, :] * grad[i, :]|.sum()`` with reduction over ``dim=1``."""
+(output-dim neurons).  Importance is :math:`|W \\odot \\nabla_W \\mathcal{L}|`
+reduced along ``dim=1``."""
 
 DEFAULT_COLUMN_MODULES: List[str] = [
     "o_proj",
     "down_proj",
 ]
 """Linear modules whose neurons correspond to **columns** of the weight matrix
-(i.e. input-dimension neurons).  Importance is computed as
-``|W[:, j] * grad[:, j]|.sum()`` with reduction over ``dim=0``."""
+(input-dim neurons).  Importance reduces along ``dim=0``."""
 
 DEFAULT_NORM_MODULES: List[str] = [
     "input_layernorm",
     "post_attention_layernorm",
 ]
-"""Normalization layers with a 1-D learnable weight.  Each element is treated
-as an individual "neuron".  Importance is simply ``|w[i] * grad[i]|``."""
+"""1-D normalisation weights -- each scalar is an individual "neuron".
+Add ``"q_norm"`` / ``"k_norm"`` for Qwen-3, ``"norm"`` for the final
+RMSNorm."""
 
 DEFAULT_GATE_COMBINES_WITH: Dict[str, str] = {
     "gate_proj": "up_proj",
 }
-"""Default pairing for SwiGLU architectures: ``gate_proj`` importance scores
-are added element-wise to ``up_proj`` scores before global top-k selection,
-and both modules share the resulting selected indices."""
+"""Default pairing for SwiGLU architectures: ``gate_proj`` importance is
+added element-wise to ``up_proj`` importance before global top-k, and both
+modules share the resulting selected indices."""
 
 _CONFIG_FILENAME = "critical_neuron_config.json"
 _INDICES_FILENAME = "neuron_indices.json"
 
 
+# ---------------------------------------------------------------------------
+# Free-standing index I/O helpers (indices are no longer part of the config)
+# ---------------------------------------------------------------------------
+
+
+def save_neuron_indices(save_directory: str, indices: Dict[str, List[int]]) -> None:
+    """Write ``neuron_indices.json`` to *save_directory*.
+
+    The file is a plain JSON dump of ``{module_path: [neuron_idx, ...]}``.
+    The directory is created if it does not exist.
+    """
+    os.makedirs(save_directory, exist_ok=True)
+    path = os.path.join(save_directory, _INDICES_FILENAME)
+    serialisable = {k: list(v) for k, v in indices.items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(serialisable, f, indent=2)
+
+
+def load_neuron_indices(load_directory: str) -> Dict[str, List[int]]:
+    """Read ``neuron_indices.json`` from *load_directory*.
+
+    Raises ``FileNotFoundError`` if the file is missing.
+    """
+    path = os.path.join(load_directory, _INDICES_FILENAME)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# CriticalNeuronConfig
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class CriticalNeuronConfig:
-    """Configuration for critical-neuron detection and fine-tuning.
+    """Architectural description of which modules carry "neurons".
 
-    Module categories
-    -----------------
-    Modules are split into three categories that determine how "neurons" are
-    defined and how the delta-subspace wrapper operates:
+    Modules are split into four categories that determine how a "neuron"
+    is defined and how the delta-subspace wrapper operates:
 
     * **row_modules** -- ``nn.Linear`` layers where each row of the weight
       matrix is one neuron (e.g. ``q_proj``, ``up_proj``).
@@ -86,48 +117,46 @@ class CriticalNeuronConfig:
       neuron (e.g. ``o_proj``, ``down_proj``).
     * **norm_modules** -- normalisation layers (``RMSNorm`` / ``LayerNorm``)
       with a 1-D weight vector; each scalar element is one neuron.
+    * **embedding_modules** -- ``nn.Embedding`` layers where each row (one
+      vocab item) is one neuron.
 
-    ``embed_tokens`` and ``lm_head`` are deliberately excluded: wrapping
-    them is incompatible with fused-kernel libraries (e.g. Liger) and
-    weight-tying, and they are skipped by default in
-    :func:`get_neuron_model`.
+    ``embed_tokens`` and ``lm_head`` are *not* excluded by the config
+    itself; they are skipped by :func:`~critnet.model.get_neuron_model`
+    via :data:`~critnet.model.DEFAULT_SKIP_MODULES` to avoid breaking
+    fused kernels and weight-tying.  Pass
+    ``modules_to_skip=set()`` to override.
 
     Smart defaults
     --------------
-    Any category left as ``None`` is automatically populated with the
-    standard module names shared by LLaMA, Mistral, and Qwen.  Pass an
-    explicit list (even an empty ``[]``) to override a default.
+    Any category left as ``None`` is populated with the standard
+    LLaMA / Mistral / Qwen suffixes.  Pass an explicit list (including
+    an empty ``[]``) to override.
 
     Parameters
     ----------
     row_modules : list[str] or None
         Module-name suffixes for row-neuron linear layers.
-        *Default:* ``["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]``.
+        Default: ``["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]``.
     column_modules : list[str] or None
         Module-name suffixes for column-neuron linear layers.
-        *Default:* ``["o_proj", "down_proj"]``.
+        Default: ``["o_proj", "down_proj"]``.
     norm_modules : list[str] or None
-        Module-name suffixes for normalisation layers.
-        *Default:* ``["input_layernorm", "post_attention_layernorm"]``.
-        Add ``"q_norm"``, ``"k_norm"`` for Qwen-3 or ``"norm"`` for the
-        final RMSNorm.
+        Module-name suffixes for 1-D norm weights.
+        Default: ``["input_layernorm", "post_attention_layernorm"]``.
     embedding_modules : list[str] or None
-        Module-name suffixes for embedding layers.  *Default:* ``None``
-        (not included).  Advanced use only.
-    sparsity_ratio : float
-        Fraction of total neurons to keep as "critical" during global
-        top-k selection.  Must be in (0, 1).  *Default:* ``0.05`` (5 %).
+        Module-name suffixes for embedding layers.
+        Default: ``None`` (embeddings are off; pass a list to opt in).
     gate_combines_with : dict[str, str] or None
-        Mapping from a "gate" module suffix to its partner, so their
-        importance scores are summed before selection and they share the
-        same neuron indices.
-        *Default:* ``{"gate_proj": "up_proj"}``.
-    neuron_indices : dict[str, list[int]] or None
-        Detected neuron indices keyed by **full module path** (e.g.
-        ``"model.layers.0.self_attn.q_proj"``).  Populated by
-        :class:`NeuronDetector` or loaded from disk.
+        Mapping from a "gate" suffix to a "partner" suffix.  The gate's
+        importance is added element-wise into the partner before global
+        top-k; both modules then share the resulting indices.
+        Default: ``{"gate_proj": "up_proj"}`` when both appear in the
+        linear lists.  ``{}`` disables gate-combination.
     base_model_name_or_path : str or None
-        HuggingFace model identifier or local path for the base model.
+        Optional metadata recording the HuggingFace model id / local
+        path the config was built for.  Used by
+        :meth:`~critnet.model.CriticalNeuronModel.from_pretrained` as a
+        fallback when no explicit base path is provided.
     """
 
     row_modules: Optional[List[str]] = None
@@ -135,23 +164,22 @@ class CriticalNeuronConfig:
     norm_modules: Optional[List[str]] = None
     embedding_modules: Optional[List[str]] = None
 
-    sparsity_ratio: float = 0.05
-
     gate_combines_with: Optional[Dict[str, str]] = None
-
-    neuron_indices: Optional[Dict[str, List[int]]] = field(default=None, repr=False)
 
     base_model_name_or_path: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
     def __post_init__(self) -> None:
-        # ---- smart defaults ------------------------------------------------
         if self.row_modules is None:
             self.row_modules = list(DEFAULT_ROW_MODULES)
         if self.column_modules is None:
             self.column_modules = list(DEFAULT_COLUMN_MODULES)
         if self.norm_modules is None:
             self.norm_modules = list(DEFAULT_NORM_MODULES)
-        # embedding_modules stays None unless the user explicitly provides it
+        # embedding_modules stays None unless explicitly provided
 
         if self.gate_combines_with is None:
             linear = set(self.row_modules or []) | set(self.column_modules or [])
@@ -167,13 +195,6 @@ class CriticalNeuronConfig:
     # ------------------------------------------------------------------
 
     def _validate(self) -> None:
-        """Run consistency checks and raise ``ValueError`` on problems."""
-        if not (0.0 < self.sparsity_ratio < 1.0):
-            raise ValueError(
-                f"sparsity_ratio must be in (0, 1), got {self.sparsity_ratio}"
-            )
-
-        # Collect all suffixes per category and check for overlaps
         categories: Dict[str, List[str]] = {
             "row_modules": self.row_modules or [],
             "column_modules": self.column_modules or [],
@@ -185,72 +206,47 @@ class CriticalNeuronConfig:
             for s in suffixes:
                 if s in seen:
                     raise ValueError(
-                        f"Module suffix '{s}' appears in both "
-                        f"'{seen[s]}' and '{cat_name}'. "
-                        f"Each suffix must belong to exactly one category."
+                        f"Module suffix '{s}' appears in both '{seen[s]}' and "
+                        f"'{cat_name}'. Each suffix must belong to exactly one "
+                        f"category."
                     )
                 seen[s] = cat_name
 
-        # gate_combines_with keys/values must reference linear categories
         linear_suffixes = set(categories["row_modules"]) | set(categories["column_modules"])
         if self.gate_combines_with:
             for gate, partner in self.gate_combines_with.items():
                 if gate not in linear_suffixes:
                     raise ValueError(
-                        f"gate_combines_with key '{gate}' is not in "
-                        f"row_modules or column_modules: {sorted(linear_suffixes)}"
+                        f"gate_combines_with key '{gate}' must appear in "
+                        f"row_modules or column_modules; got {sorted(linear_suffixes)}."
                     )
                 if partner not in linear_suffixes:
                     raise ValueError(
-                        f"gate_combines_with value '{partner}' is not in "
-                        f"row_modules or column_modules: {sorted(linear_suffixes)}"
+                        f"gate_combines_with value '{partner}' must appear in "
+                        f"row_modules or column_modules; got {sorted(linear_suffixes)}."
                     )
 
     # ------------------------------------------------------------------
-    # Computed helpers
+    # Classification (single source of truth for module typing)
     # ------------------------------------------------------------------
 
-    @property
-    def target_modules(self) -> List[str]:
-        """Union of all module-category suffixes.
-
-        Returns a flat list of every module-name suffix that this config
-        targets, across all four categories.  Useful for iterating over
-        a model's named modules and checking membership.
-        """
-        modules: List[str] = []
-        modules.extend(self.row_modules or [])
-        modules.extend(self.column_modules or [])
-        modules.extend(self.norm_modules or [])
-        modules.extend(self.embedding_modules or [])
-        return modules
-
-    @property
-    def linear_modules(self) -> List[str]:
-        """Combined list of row and column module suffixes (all ``nn.Linear`` targets)."""
-        return list(self.row_modules or []) + list(self.column_modules or [])
-
-    def get_module_type(self, module_name: str) -> str:
-        """Determine the category of a module from its name.
+    def classify(self, module_name: str) -> Optional[str]:
+        """Return the category of *module_name*, or ``None`` if not targeted.
 
         The *leaf* component of ``module_name`` (the part after the last
         ``'.'``) is matched against each category list.
 
-        Parameters
-        ----------
-        module_name : str
-            Fully-qualified module path, e.g.
-            ``"model.layers.0.self_attn.q_proj"``.
-
         Returns
         -------
-        str
-            One of ``"row"``, ``"column"``, ``"norm"``, or ``"embedding"``.
+        ``"row"`` | ``"column"`` | ``"norm"`` | ``"embedding"`` | ``None``
 
-        Raises
-        ------
-        ValueError
-            If the leaf name does not match any category.
+        Examples
+        --------
+        >>> cfg = CriticalNeuronConfig()
+        >>> cfg.classify("model.layers.0.self_attn.q_proj")
+        'row'
+        >>> cfg.classify("model.layers.0.self_attn.q_norm")  # not in defaults
+        >>> # returns None
         """
         leaf = module_name.rsplit(".", 1)[-1]
         if leaf in (self.row_modules or []):
@@ -261,106 +257,97 @@ class CriticalNeuronConfig:
             return "norm"
         if leaf in (self.embedding_modules or []):
             return "embedding"
-        raise ValueError(
-            f"Module '{module_name}' (leaf='{leaf}') does not match any "
-            f"configured category.  target_modules={self.target_modules}"
+        return None
+
+    # ------------------------------------------------------------------
+    # Computed views
+    # ------------------------------------------------------------------
+
+    @property
+    def target_modules(self) -> List[str]:
+        """Flat union of every targeted module suffix across all four categories."""
+        return (
+            list(self.row_modules or [])
+            + list(self.column_modules or [])
+            + list(self.norm_modules or [])
+            + list(self.embedding_modules or [])
         )
 
-    def matches_target(self, module_name: str) -> bool:
-        """Return ``True`` if *module_name*'s leaf matches any target suffix."""
-        leaf = module_name.rsplit(".", 1)[-1]
-        return leaf in self.target_modules
+    @property
+    def linear_modules(self) -> List[str]:
+        """``row_modules`` + ``column_modules`` (every ``nn.Linear`` target)."""
+        return list(self.row_modules or []) + list(self.column_modules or [])
 
     # ------------------------------------------------------------------
-    # Serialization
+    # Serialisation
     # ------------------------------------------------------------------
 
-    def save_pretrained(self, save_directory: str) -> None:
-        """Persist the config and neuron indices to *save_directory*.
+    def save_pretrained(
+        self,
+        save_directory: str,
+        *,
+        indices: Optional[Dict[str, List[int]]] = None,
+    ) -> None:
+        """Persist this config to *save_directory*.
 
-        Two files are written:
+        Always writes ``critical_neuron_config.json``.  If ``indices`` is
+        provided, also writes ``neuron_indices.json`` via
+        :func:`save_neuron_indices` -- a convenience equivalent to::
 
-        * ``critical_neuron_config.json`` -- all fields except
-          ``neuron_indices``.
-        * ``neuron_indices.json`` -- the neuron index mapping (only when
-          ``neuron_indices`` is not ``None``).
+            config.save_pretrained(save_directory)
+            save_neuron_indices(save_directory, indices)
         """
         os.makedirs(save_directory, exist_ok=True)
-
         config_dict = {
             "row_modules": self.row_modules,
             "column_modules": self.column_modules,
             "norm_modules": self.norm_modules,
             "embedding_modules": self.embedding_modules,
-            "sparsity_ratio": self.sparsity_ratio,
             "gate_combines_with": self.gate_combines_with,
             "base_model_name_or_path": self.base_model_name_or_path,
         }
-
-        config_path = os.path.join(save_directory, _CONFIG_FILENAME)
-        with open(config_path, "w", encoding="utf-8") as f:
+        path = os.path.join(save_directory, _CONFIG_FILENAME)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-        if self.neuron_indices is not None:
-            indices_path = os.path.join(save_directory, _INDICES_FILENAME)
-            with open(indices_path, "w", encoding="utf-8") as f:
-                json.dump(self.neuron_indices, f, indent=2)
+        if indices is not None:
+            save_neuron_indices(save_directory, indices)
 
     @classmethod
     def from_pretrained(cls, load_directory: str) -> "CriticalNeuronConfig":
-        """Load a config (and optional neuron indices) from *load_directory*.
+        """Load a config from *load_directory*.
 
-        Parameters
-        ----------
-        load_directory : str
-            Directory containing ``critical_neuron_config.json`` and
-            optionally ``neuron_indices.json``.
+        Only the config is read here.  To load the companion neuron
+        indices use :func:`load_neuron_indices` separately::
 
-        Returns
-        -------
-        CriticalNeuronConfig
+            config = CriticalNeuronConfig.from_pretrained("./neurons")
+            indices = load_neuron_indices("./neurons")
         """
-        config_path = os.path.join(load_directory, _CONFIG_FILENAME)
-        with open(config_path, "r", encoding="utf-8") as f:
-            config_dict = json.load(f)
-
-        indices_path = os.path.join(load_directory, _INDICES_FILENAME)
-        neuron_indices = None
-        if os.path.isfile(indices_path):
-            with open(indices_path, "r", encoding="utf-8") as f:
-                neuron_indices = json.load(f)
-
+        path = os.path.join(load_directory, _CONFIG_FILENAME)
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
         return cls(
-            row_modules=config_dict.get("row_modules"),
-            column_modules=config_dict.get("column_modules"),
-            norm_modules=config_dict.get("norm_modules"),
-            embedding_modules=config_dict.get("embedding_modules"),
-            sparsity_ratio=config_dict.get("sparsity_ratio", 0.05),
-            gate_combines_with=config_dict.get("gate_combines_with"),
-            neuron_indices=neuron_indices,
-            base_model_name_or_path=config_dict.get("base_model_name_or_path"),
+            row_modules=d.get("row_modules"),
+            column_modules=d.get("column_modules"),
+            norm_modules=d.get("norm_modules"),
+            embedding_modules=d.get("embedding_modules"),
+            gate_combines_with=d.get("gate_combines_with"),
+            base_model_name_or_path=d.get("base_model_name_or_path"),
         )
 
     # ------------------------------------------------------------------
-    # Repr / summary
+    # Repr
     # ------------------------------------------------------------------
 
     def summary(self) -> str:
-        """Return a human-readable summary string."""
+        """Return a human-readable description."""
         lines = [
             "CriticalNeuronConfig",
-            f"  row_modules      : {self.row_modules}",
-            f"  column_modules   : {self.column_modules}",
-            f"  norm_modules     : {self.norm_modules}",
-            f"  embedding_modules: {self.embedding_modules}",
-            f"  sparsity_ratio   : {self.sparsity_ratio}",
+            f"  row_modules       : {self.row_modules}",
+            f"  column_modules    : {self.column_modules}",
+            f"  norm_modules      : {self.norm_modules}",
+            f"  embedding_modules : {self.embedding_modules}",
             f"  gate_combines_with: {self.gate_combines_with}",
-            f"  base_model       : {self.base_model_name_or_path}",
+            f"  base_model        : {self.base_model_name_or_path}",
         ]
-        if self.neuron_indices is not None:
-            n_modules = len(self.neuron_indices)
-            n_neurons = sum(len(v) for v in self.neuron_indices.values())
-            lines.append(f"  neuron_indices   : {n_neurons} neurons across {n_modules} modules")
-        else:
-            lines.append("  neuron_indices   : not loaded")
         return "\n".join(lines)

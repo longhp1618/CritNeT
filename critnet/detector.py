@@ -1,15 +1,24 @@
-"""Neuron importance detection via first-order Taylor expansion.
+"""First-order Taylor importance detection.
 
-Given a model and a dataset the :class:`NeuronDetector` computes
-per-neuron impact scores:
+For a parameter tensor :math:`W` and a calibration loss :math:`\\mathcal{L}`,
+each candidate "neuron" -- a row of :math:`W`, a column of :math:`W`, or a
+single scalar of a 1-D norm weight -- receives a scalar importance score
 
 .. math::
 
-    \\mathcal{I}_t(w_i) \\approx \\left| w_i^\\top
-    \\nabla_{w_i}\\mathcal{L}(\\Theta, \\mathcal{D}_t) \\right|
+    \\mathcal{I}(w_i) \\;\\approx\\; \\bigl|w_i^{\\top}\\,\\nabla_{w_i}\\mathcal{L}\\bigr|.
 
-and selects the global top-k most critical neurons across all target
-modules.
+Scores from every targeted module are pooled into a single list and the
+top ``sparsity_ratio`` fraction is kept.  SwiGLU gate/up partners share
+selected indices (see :class:`~critnet.config.CriticalNeuronConfig`).
+
+Public surface
+--------------
+* :class:`NeuronDetector` -- runs the detection from a model + dataloader.
+* :class:`DetectionResult` -- immutable record returned by both
+  :meth:`NeuronDetector.detect` and :func:`select_neurons_from_cache`.
+* :func:`select_neurons_from_cache` -- replay top-k from a saved importance
+  cache without loading a model.
 """
 
 from __future__ import annotations
@@ -18,7 +27,9 @@ import inspect
 import logging
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,36 +37,98 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import CriticalNeuronConfig
-from .model import _is_norm
 
 logger = logging.getLogger(__name__)
 
-# torch.save payload written by :meth:`NeuronDetector.save_importance_cache`.
+# Schema version for files written by :func:`_save_importance_cache`.
+# Bumped only on breaking changes; readers refuse mismatching majors.
 _IMPORTANCE_CACHE_VERSION = 1
 
 
+# =====================================================================
+# DetectionResult
+# =====================================================================
+
+
+@dataclass
+class DetectionResult:
+    """Immutable record of one detection run.
+
+    Attributes
+    ----------
+    indices
+        Mapping from full module path to the **sorted** list of selected
+        neuron indices.
+    sparsity_ratio
+        The fraction of pooled neurons retained.
+    gate_to_partner_path
+        Mapping from each gate module path to its partner module path
+        (for SwiGLU-style sharing).  Empty when ``gate_combines_with``
+        was disabled or no gate/partner pairs were targeted.
+
+    Notes
+    -----
+    The result deliberately does **not** mutate any config -- to attach
+    these indices to a config for downstream use, do so explicitly::
+
+        result = detector.detect(loader, sparsity_ratio=0.05)
+        config.save_pretrained("./neurons", indices=result.indices)
+    """
+
+    indices: Dict[str, List[int]]
+    sparsity_ratio: float
+    gate_to_partner_path: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def total_selected(self) -> int:
+        """Total number of selected neurons across all modules."""
+        return sum(len(v) for v in self.indices.values())
+
+    @property
+    def n_modules(self) -> int:
+        """Number of modules that received at least one selected neuron."""
+        return len(self.indices)
+
+    def summary(self) -> str:
+        """One-line human-readable summary."""
+        return (
+            f"DetectionResult(sparsity_ratio={self.sparsity_ratio:.4f}, "
+            f"total_selected={self.total_selected:,}, "
+            f"n_modules={self.n_modules})"
+        )
+
+
+# =====================================================================
+# NeuronDetector
+# =====================================================================
+
+
 class NeuronDetector:
-    """Detect critical neurons using first-order Taylor importance scores.
+    """Detect critical neurons from a calibration corpus.
 
     Parameters
     ----------
-    model : nn.Module or None
-        A pretrained ``transformers`` model **before** any wrapping for
-        :meth:`detect`.  May be ``None`` when only using
-        :meth:`select_from_importance_cache`.
-    config : CriticalNeuronConfig
-        Configuration specifying which modules to target and the
-        sparsity ratio.
+    model
+        A pretrained ``transformers`` model **before** any wrapping.
+    config
+        Architectural description of which modules carry neurons.
 
     Example
     -------
-    >>> config = CriticalNeuronConfig(sparsity_ratio=0.05)
     >>> detector = NeuronDetector(model, config)
-    >>> indices = detector.detect(dataloader)
-    >>> detector.save("./detected_neurons")
+    >>> result = detector.detect(loader, sparsity_ratio=0.05)
+    >>> config.save_pretrained("./neurons", indices=result.indices)
+
+    For a cache-only ratio sweep (no model load), use the module-level
+    :func:`select_neurons_from_cache` instead.
     """
 
-    def __init__(self, model: Optional[nn.Module], config: CriticalNeuronConfig) -> None:
+    def __init__(self, model: nn.Module, config: CriticalNeuronConfig) -> None:
+        if not isinstance(model, nn.Module):
+            raise TypeError(
+                "NeuronDetector requires a model. For cache-only selection use "
+                "critnet.select_neurons_from_cache(cache_path, config, sparsity_ratio=...)."
+            )
         self.model = model
         self.config = config
 
@@ -66,261 +139,368 @@ class NeuronDetector:
     def detect(
         self,
         dataloader: DataLoader,
+        *,
+        sparsity_ratio: float,
         save_importance_cache_path: Optional[str] = None,
-    ) -> Dict[str, List[int]]:
-        """Run importance detection and return neuron indices.
+    ) -> DetectionResult:
+        """Accumulate gradients over *dataloader* and return the top-k neurons.
 
         Parameters
         ----------
-        dataloader : DataLoader
-            Must yield dicts with at least ``input_ids``,
-            ``attention_mask``, and ``labels``.  The dataset / collator
-            is responsible for preparing ``labels`` appropriately:
-
-            * **Chat SFT:** mask prompt tokens to ``-100`` so only
-              completion tokens contribute to the loss.
-            * **Pre-training:** set ``labels`` equal to ``input_ids``
-              (standard next-token prediction on every token).
-        save_importance_cache_path : str, optional
-            If set, persist the **post–gate-combined** per-module importance
-            tensors (CPU floats) plus gate metadata so a later run can call
-            :meth:`select_from_importance_cache` with a different
+        dataloader
+            Each batch must be a ``dict`` containing at least
+            ``input_ids``, ``attention_mask``, and ``labels``.  The
+            collator is responsible for preparing ``labels``: mask prompt
+            tokens to ``-100`` for chat SFT, or set ``labels`` equal to
+            ``input_ids`` for pre-training.
+        sparsity_ratio
+            Fraction of pooled neurons (across every targeted module) to
+            retain.  Must be strictly in :math:`(0, 1]`.
+        save_importance_cache_path
+            Optional path; when given, the **post-gate-combined** per-module
+            score tensors and gate metadata are pickled with
+            :func:`torch.save` so a later run can call
+            :func:`select_neurons_from_cache` with a different
             ``sparsity_ratio`` without another backward pass.
 
         Returns
         -------
-        dict[str, list[int]]
-            Mapping from full module path to sorted list of selected
-            neuron indices.  Also stored in ``self.config.neuron_indices``.
+        DetectionResult
+
+        Notes
+        -----
+        ``detect`` is non-mutating to the caller's perspective: the
+        model's training mode and the ``requires_grad`` flags of target
+        parameters are restored on exit, and ``model.zero_grad()`` is
+        called both before and after the backward loop.
         """
-        if self.model is None:
-            raise ValueError("detect() requires a model; use select_from_importance_cache() for cached scores.")
+        _validate_ratio(sparsity_ratio)
 
-        device = next(self.model.parameters()).device
-        self.model.train()
-
-        target_params = self._find_target_params()
-        for _, param in target_params:
-            param.requires_grad_(True)
-
-        self.model.zero_grad()
-
-        total_loss = 0.0
-        num_batches = 0
-        for batch in tqdm(dataloader, desc="NeuronDetector: accumulating gradients"):
-            inputs = {k: v.to(device) for k, v in batch.items()}
-            outputs = self.model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-            total_loss += loss.item()
-            num_batches += 1
-
-        if num_batches > 0:
-            logger.info("Average loss over %d batches: %.4f", num_batches, total_loss / num_batches)
-
-        neuron_scores = self._compute_scores(target_params)
-
-        neuron_scores = self._apply_gate_combination(neuron_scores)
+        scores, gate_map = self._compute_combined_scores(dataloader)
 
         if save_importance_cache_path is not None:
-            self.save_importance_cache(neuron_scores, save_importance_cache_path)
+            _save_importance_cache(save_importance_cache_path, scores, gate_map)
 
-        neuron_indices = self._global_topk(neuron_scores)
+        indices = _global_topk(scores, sparsity_ratio, gate_map)
 
-        self.config.neuron_indices = neuron_indices
-        return neuron_indices
+        return DetectionResult(
+            indices=indices,
+            sparsity_ratio=sparsity_ratio,
+            gate_to_partner_path=dict(gate_map),
+        )
 
-    def save(self, save_path: str) -> None:
-        """Persist detected indices and config to *save_path*."""
-        self.config.save_pretrained(save_path)
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
-    def save_importance_cache(
-        self,
-        combined_scores: Dict[str, torch.Tensor],
-        path: str,
-    ) -> None:
-        """Write combined per-module importance tensors (after gate merge) to disk.
+    def _find_target_params(self) -> List[Tuple[str, nn.Parameter]]:
+        """Return ``(full_param_name, Parameter)`` for every targeted weight."""
+        out: List[Tuple[str, nn.Parameter]] = []
+        for mod_name, module in self.model.named_modules():
+            if self.config.classify(mod_name) is None:
+                continue
+            if getattr(module, "weight", None) is not None:
+                out.append((f"{mod_name}.weight", module.weight))
+        return out
 
-        The file is a ``torch.save`` blob with keys ``version``, ``scores``,
-        and ``gate_to_partner_path``.  Load with
-        :meth:`select_from_importance_cache` using a config whose module
-        lists and ``gate_combines_with`` match the run that produced the
-        cache.
-        """
-        payload = {
-            "version": _IMPORTANCE_CACHE_VERSION,
-            "scores": {k: v.contiguous().clone() for k, v in combined_scores.items()},
-            "gate_to_partner_path": dict(
-                getattr(self, "_gate_to_partner_path", {})
-            ),
-        }
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        torch.save(payload, path)
-        logger.info("Wrote importance cache (%d modules) to %s", len(combined_scores), path)
+    def _compute_combined_scores(
+        self, dataloader: DataLoader
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
+        """Run the backward pass and return (gate-merged scores, gate map)."""
+        device = next(self.model.parameters()).device
+        target_params = self._find_target_params()
 
-    def select_from_importance_cache(self, path: str) -> Dict[str, List[int]]:
-        """Load a cache from :meth:`save_importance_cache` and run global top-k.
-
-        Uses ``self.config.sparsity_ratio`` (and gate metadata in the file)
-        to produce ``self.config.neuron_indices``.
-        """
-        load_kw: Dict[str, object] = {"map_location": "cpu"}
-        if "weights_only" in inspect.signature(torch.load).parameters:
-            load_kw["weights_only"] = False
-        payload = torch.load(path, **load_kw)  # type: ignore[arg-type]
-        if isinstance(payload, dict) and "scores" in payload:
-            scores: Dict[str, torch.Tensor] = payload["scores"]
-            self._gate_to_partner_path = dict(payload.get("gate_to_partner_path") or {})
-        else:
-            # Raw dict[str, Tensor] from older or manual saves — gate mirroring may be incomplete.
-            scores = payload  # type: ignore[assignment]
-            self._gate_to_partner_path = {}
-            logger.warning(
-                "Importance cache at %s has no gate_to_partner_path metadata; "
-                "gate modules may miss mirrored indices.",
-                path,
+        if not target_params:
+            raise ValueError(
+                "No target parameters found. Check that the config's module "
+                "categories match the model's module names."
             )
 
-        neuron_indices = self._global_topk(scores)
-        self.config.neuron_indices = neuron_indices
-        return neuron_indices
+        with _detect_state(self.model, [p for _, p in target_params]):
+            self.model.zero_grad()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+            total_loss = 0.0
+            num_batches = 0
+            for batch in tqdm(
+                dataloader, desc="NeuronDetector: accumulating gradients"
+            ):
+                inputs = {k: v.to(device) for k, v in batch.items()}
+                outputs = self.model(**inputs)
+                loss = outputs.loss
+                loss.backward()
+                total_loss += loss.item()
+                num_batches += 1
 
-    def _find_target_params(self) -> List[tuple]:
-        """Return ``(full_param_name, Parameter)`` for all target weight tensors."""
-        if self.model is None:
-            raise ValueError("_find_target_params requires a model.")
-        target_params: List[tuple] = []
-        for mod_name, module in self.model.named_modules():
-            if not self.config.matches_target(mod_name):
-                continue
-            if hasattr(module, "weight") and module.weight is not None:
-                param_name = f"{mod_name}.weight"
-                target_params.append((param_name, module.weight))
-        return target_params
+            if num_batches > 0:
+                logger.info(
+                    "Average loss over %d batches: %.4f",
+                    num_batches, total_loss / num_batches,
+                )
 
-    def _compute_scores(
-        self, target_params: List[tuple]
+            raw_scores = self._reduce_scores(target_params)
+
+        scores, gate_map = _apply_gate_combination(raw_scores, self.config)
+        return scores, gate_map
+
+    def _reduce_scores(
+        self, target_params: List[Tuple[str, nn.Parameter]]
     ) -> Dict[str, torch.Tensor]:
-        """Compute per-neuron importance ``|W * grad|`` reduced along the appropriate axis."""
+        """Reduce :math:`|W \\odot \\nabla W|` to one score per neuron."""
         scores: Dict[str, torch.Tensor] = {}
-
         for param_name, param in target_params:
             if param.grad is None:
                 continue
-
             mod_name = param_name.rsplit(".weight", 1)[0]
-
-            importance = torch.abs(param.data * param.grad)
-
-            mod_type = self.config.get_module_type(mod_name)
-
-            if mod_type == "row":
-                if importance.dim() == 2:
-                    neuron_scores = importance.sum(dim=1).float().cpu()
-                else:
-                    neuron_scores = importance.float().cpu()
-            elif mod_type == "column":
-                if importance.dim() == 2:
-                    neuron_scores = importance.sum(dim=0).float().cpu()
-                else:
-                    neuron_scores = importance.float().cpu()
-            elif mod_type == "norm":
-                neuron_scores = importance.float().cpu()
-            elif mod_type == "embedding":
-                if importance.dim() == 2:
-                    neuron_scores = importance.sum(dim=1).float().cpu()
-                else:
-                    neuron_scores = importance.float().cpu()
-            else:
+            mod_type = self.config.classify(mod_name)
+            if mod_type is None:
                 continue
 
-            scores[mod_name] = neuron_scores
+            importance = torch.abs(param.data * param.grad)
+            if mod_type == "row":
+                neuron_scores = (
+                    importance.sum(dim=1) if importance.dim() == 2 else importance
+                )
+            elif mod_type == "column":
+                neuron_scores = (
+                    importance.sum(dim=0) if importance.dim() == 2 else importance
+                )
+            elif mod_type == "norm":
+                neuron_scores = importance
+            elif mod_type == "embedding":
+                neuron_scores = (
+                    importance.sum(dim=1) if importance.dim() == 2 else importance
+                )
+            else:  # pragma: no cover -- exhaustive over classify() output
+                continue
 
+            scores[mod_name] = neuron_scores.detach().float().cpu()
         return scores
 
-    def _apply_gate_combination(
-        self, scores: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Combine gate/partner importance scores and assign shared indices.
 
-        For each ``(gate, partner)`` pair in ``config.gate_combines_with``,
-        add the gate's scores element-wise into the partner's scores, then
-        remove the gate entry so both modules later share the partner's
-        selected indices.
-        """
-        if not self.config.gate_combines_with:
-            return scores
+# =====================================================================
+# Cache-only sweep entry point
+# =====================================================================
 
-        gate_suffix_to_partner: Dict[str, str] = self.config.gate_combines_with
 
-        gate_to_partner_path: Dict[str, str] = {}
-        for mod_path in list(scores.keys()):
-            leaf = mod_path.rsplit(".", 1)[-1]
-            if leaf in gate_suffix_to_partner:
-                partner_suffix = gate_suffix_to_partner[leaf]
-                partner_path = mod_path.rsplit(".", 1)[0] + "." + partner_suffix
-                gate_to_partner_path[mod_path] = partner_path
+def select_neurons_from_cache(
+    cache_path: str,
+    config: CriticalNeuronConfig,
+    *,
+    sparsity_ratio: float,
+) -> DetectionResult:
+    """Replay global top-k from a previously saved importance cache.
 
-        for gate_path, partner_path in gate_to_partner_path.items():
-            if gate_path in scores and partner_path in scores:
-                if scores[gate_path].shape == scores[partner_path].shape:
-                    scores[partner_path] = scores[partner_path] + scores[gate_path]
-                    del scores[gate_path]
-                else:
-                    logger.warning(
-                        "Cannot combine gate '%s' (%s) with partner '%s' (%s): shape mismatch. Keeping separate.",
-                        gate_path, scores[gate_path].shape,
-                        partner_path, scores[partner_path].shape,
-                    )
+    The companion of :meth:`NeuronDetector.detect`'s
+    ``save_importance_cache_path`` argument.  Reads the cache (no model
+    needed), runs top-k at the requested *sparsity_ratio*, and returns a
+    fresh :class:`DetectionResult`.  Cheap; safe to call in a tight loop
+    when sweeping ratios.
 
-        self._gate_to_partner_path = gate_to_partner_path
-        return scores
+    Parameters
+    ----------
+    cache_path
+        Path to a file written by :meth:`NeuronDetector.detect` via
+        ``save_importance_cache_path``.
+    config
+        Used only to attach :class:`DetectionResult` metadata; the cache
+        already carries the per-module scores and gate map.
+    sparsity_ratio
+        Same semantics as :meth:`NeuronDetector.detect`.
 
-    def _global_topk(
-        self, scores: Dict[str, torch.Tensor]
-    ) -> Dict[str, List[int]]:
-        """Pool all neuron scores and select global top-k."""
-        all_scores: List[float] = []
-        score_meta: List[tuple] = []
+    Returns
+    -------
+    DetectionResult
+    """
+    _validate_ratio(sparsity_ratio)
+    del config  # accepted for API symmetry; cache is self-sufficient.
 
-        for mod_path, s in scores.items():
-            for idx in range(s.numel()):
-                all_scores.append(s[idx].item())
-                score_meta.append((mod_path, idx))
+    scores, gate_map = _load_importance_cache(cache_path)
+    indices = _global_topk(scores, sparsity_ratio, gate_map)
+    return DetectionResult(
+        indices=indices,
+        sparsity_ratio=sparsity_ratio,
+        gate_to_partner_path=dict(gate_map),
+    )
 
-        if not all_scores:
-            logger.warning("No importance scores computed -- returning empty indices.")
-            return {}
 
-        total = len(all_scores)
-        k = max(1, int(total * self.config.sparsity_ratio))
+# =====================================================================
+# Module-level helpers
+# =====================================================================
 
-        scores_tensor = torch.tensor(all_scores)
-        top_scores, top_indices = torch.topk(scores_tensor, k, largest=True, sorted=True)
 
-        selected: Dict[str, List[int]] = defaultdict(list)
-        for flat_idx in top_indices.tolist():
-            mod_path, neuron_idx = score_meta[flat_idx]
-            selected[mod_path].append(neuron_idx)
-
-        # Assign gate modules the same indices as their partner
-        gate_to_partner = getattr(self, "_gate_to_partner_path", {})
-        for gate_path, partner_path in gate_to_partner.items():
-            if partner_path in selected:
-                selected[gate_path] = list(selected[partner_path])
-
-        for mod_path in selected:
-            selected[mod_path].sort()
-
-        logger.info(
-            "Global top-k: %d / %d neurons (score range %.6f .. %.6f)",
-            k, total, top_scores[-1].item(), top_scores[0].item(),
+def _validate_ratio(sparsity_ratio: float) -> None:
+    if not isinstance(sparsity_ratio, (int, float)):
+        raise TypeError(f"sparsity_ratio must be a number, got {type(sparsity_ratio).__name__}")
+    if not (0.0 < float(sparsity_ratio) <= 1.0):
+        raise ValueError(
+            f"sparsity_ratio must be in (0, 1], got {sparsity_ratio!r}."
         )
 
-        return dict(selected)
+
+@contextmanager
+def _detect_state(
+    model: nn.Module, target_params: List[nn.Parameter]
+) -> Iterator[None]:
+    """Temporarily enable grads on *target_params* and ``train()`` mode.
+
+    Restores ``training`` mode and the previous ``requires_grad`` flags
+    on exit, then calls ``model.zero_grad()`` so callers do not inherit
+    stale gradients.
+    """
+    was_training = model.training
+    saved_flags = [p.requires_grad for p in target_params]
+    try:
+        model.train()
+        for p in target_params:
+            p.requires_grad_(True)
+        yield
+    finally:
+        for p, flag in zip(target_params, saved_flags):
+            p.requires_grad_(flag)
+        if not was_training:
+            model.eval()
+        model.zero_grad(set_to_none=True)
+
+
+def _apply_gate_combination(
+    scores: Dict[str, torch.Tensor],
+    config: CriticalNeuronConfig,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
+    """Fold gate scores into partner scores; return (scores, gate->partner map).
+
+    For each ``(gate_suffix, partner_suffix)`` in
+    ``config.gate_combines_with``, every concrete ``gate_path`` whose
+    leaf is ``gate_suffix`` has its scores added element-wise into the
+    sibling ``partner_path`` (same parent module, leaf ``partner_suffix``).
+    The gate entry is then removed from ``scores`` and recorded in the
+    returned map so :func:`_global_topk` can mirror the partner's
+    selected indices back onto the gate.
+    """
+    out = dict(scores)
+    gate_suffix_to_partner = config.gate_combines_with or {}
+    if not gate_suffix_to_partner:
+        return out, {}
+
+    gate_to_partner_path: Dict[str, str] = {}
+    for mod_path in list(out.keys()):
+        leaf = mod_path.rsplit(".", 1)[-1]
+        partner_suffix = gate_suffix_to_partner.get(leaf)
+        if partner_suffix is None:
+            continue
+        partner_path = mod_path.rsplit(".", 1)[0] + "." + partner_suffix
+        gate_to_partner_path[mod_path] = partner_path
+
+    for gate_path, partner_path in gate_to_partner_path.items():
+        if gate_path in out and partner_path in out:
+            if out[gate_path].shape == out[partner_path].shape:
+                out[partner_path] = out[partner_path] + out[gate_path]
+                del out[gate_path]
+            else:
+                logger.warning(
+                    "Cannot combine gate '%s' (%s) with partner '%s' (%s): "
+                    "shape mismatch. Keeping them separate.",
+                    gate_path, tuple(out[gate_path].shape),
+                    partner_path, tuple(out[partner_path].shape),
+                )
+
+    return out, gate_to_partner_path
+
+
+def _global_topk(
+    scores: Dict[str, torch.Tensor],
+    sparsity_ratio: float,
+    gate_to_partner_path: Dict[str, str],
+) -> Dict[str, List[int]]:
+    """Pool every per-neuron score and keep the top *sparsity_ratio* fraction.
+
+    After top-k, gates listed in *gate_to_partner_path* receive a copy
+    of their partner's selected indices.  Output is sorted per module.
+    """
+    if not scores:
+        logger.warning("No importance scores were computed -- returning empty indices.")
+        return {}
+
+    flat: List[float] = []
+    meta: List[Tuple[str, int]] = []
+    for mod_path, s in scores.items():
+        s_flat = s.reshape(-1)
+        for idx in range(s_flat.numel()):
+            flat.append(s_flat[idx].item())
+            meta.append((mod_path, idx))
+
+    total = len(flat)
+    k = max(1, int(total * sparsity_ratio))
+    scores_tensor = torch.tensor(flat)
+    top_vals, top_idx = torch.topk(scores_tensor, k, largest=True, sorted=True)
+
+    selected: Dict[str, List[int]] = defaultdict(list)
+    for flat_idx in top_idx.tolist():
+        mod_path, neuron_idx = meta[flat_idx]
+        selected[mod_path].append(neuron_idx)
+
+    for gate_path, partner_path in gate_to_partner_path.items():
+        if partner_path in selected:
+            selected[gate_path] = list(selected[partner_path])
+
+    for mod_path in selected:
+        selected[mod_path].sort()
+
+    logger.info(
+        "Global top-k: %d / %d neurons (score range %.6g .. %.6g)",
+        k, total, top_vals[-1].item(), top_vals[0].item(),
+    )
+    return dict(selected)
+
+
+# ---------------------------------------------------------------------------
+# Importance cache I/O
+# ---------------------------------------------------------------------------
+
+
+def _save_importance_cache(
+    path: str,
+    scores: Dict[str, torch.Tensor],
+    gate_to_partner_path: Dict[str, str],
+) -> None:
+    """Write the combined-score blob to *path* (``torch.save``)."""
+    payload = {
+        "version": _IMPORTANCE_CACHE_VERSION,
+        "scores": {k: v.contiguous().clone() for k, v in scores.items()},
+        "gate_to_partner_path": dict(gate_to_partner_path),
+    }
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    torch.save(payload, path)
+    logger.info(
+        "Wrote importance cache (v%d, %d modules) to %s",
+        _IMPORTANCE_CACHE_VERSION, len(scores), path,
+    )
+
+
+def _load_importance_cache(
+    path: str,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
+    """Read an importance cache and return ``(scores, gate_to_partner_path)``."""
+    load_kw: Dict[str, object] = {"map_location": "cpu"}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kw["weights_only"] = False
+    payload = torch.load(path, **load_kw)  # type: ignore[arg-type]
+
+    if not isinstance(payload, dict) or "scores" not in payload:
+        # Tolerate raw ``dict[str, Tensor]`` blobs from older / manual saves.
+        logger.warning(
+            "Importance cache at %s has no metadata header; gate modules "
+            "may miss mirrored indices.", path,
+        )
+        return dict(payload), {}  # type: ignore[arg-type]
+
+    version = int(payload.get("version", 0))
+    if version != _IMPORTANCE_CACHE_VERSION:
+        raise ValueError(
+            f"Importance cache at {path} has version {version}, but this "
+            f"build of critnet expects version {_IMPORTANCE_CACHE_VERSION}."
+        )
+    scores: Dict[str, torch.Tensor] = payload["scores"]
+    gate_map: Dict[str, str] = dict(payload.get("gate_to_partner_path") or {})
+    return scores, gate_map

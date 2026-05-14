@@ -77,7 +77,6 @@ def _merge_unique(base: Optional[List[str]], extra: List[str]) -> List[str]:
 
 def _build_config(
     model_name: str,
-    ratio: float,
     row_modules: Optional[str],
     column_modules: Optional[str],
     norm_modules: Optional[str],
@@ -99,7 +98,6 @@ def _build_config(
         column_modules=col_m,
         norm_modules=norm_m,
         embedding_modules=emb_m,
-        sparsity_ratio=ratio,
     )
 
 
@@ -379,7 +377,6 @@ def main() -> None:
 
             config = _build_config(
                 args.model_name,
-                0.05,
                 args.row_modules,
                 args.column_modules,
                 args.norm_modules,
@@ -451,7 +448,7 @@ def main() -> None:
                 if not args.no_pair_neuron_json:
                     save_pair_neuron_jsons(pair_dir, result, args.stype_a, args.stype_b)
                 if args.write_per_pair_reports:
-                    statistician.save_report(str(pair_dir))
+                    result.save_report(str(pair_dir))
         else:
             print(f"Parallel mode: {nw} workers (no model load; mp_context=spawn).", file=sys.stderr)
             jobs = [

@@ -22,10 +22,17 @@ Requires Python ≥ 3.9, PyTorch, and a recent `transformers`. From the reposito
 pip install -e .
 ```
 
-The [Quickstart](#quickstart-isolate-the-safety-neurons-of-llama-31-8b-instruct) additionally uses `datasets` and `trl` for loading and tokenizing the public calibration corpora:
+The [Quickstart](#quickstart-isolate-the-safety-neurons-of-qwen3-4b-instruct) additionally uses `datasets` and `trl` for loading and tokenizing the public calibration corpora:
 
 ```bash
 pip install datasets trl
+```
+
+For the test suite:
+
+```bash
+pip install -e ".[test]"
+pytest
 ```
 
 A single GPU with ≥ 40 GB of memory is enough to run the Quickstart on Qwen3-4B-Instruct in bfloat16.
@@ -38,13 +45,20 @@ The library is one self-contained Python package:
 
 ```
 critnet/
-├── config.py         CriticalNeuronConfig    target modules + sparsity_ratio + on-disk format
-├── detector.py       NeuronDetector          first-order Taylor importance + global top-k
-├── statistician.py   NeuronStatistician      union / intersection / per-task exclusive sets
-├── deactivator.py    NeuronDeactivator       zero out selected neurons (ablation)
-└── model.py          get_neuron_model        sparse-PEFT wrapper (LinearDeltaSubspace, ...)
-                      CriticalNeuronModel     save / load / merge adapters
-                      freeze_neurons          freeze neurons during full fine-tuning
+├── config.py         CriticalNeuronConfig         target modules + on-disk format
+│                     save_neuron_indices,         module-level I/O helpers for the
+│                     load_neuron_indices            companion neuron_indices.json
+├── detector.py       NeuronDetector               first-order Taylor importance + global top-k
+│                     DetectionResult              immutable record returned by detect()
+│                     select_neurons_from_cache    cache-only ratio sweep (no model needed)
+├── statistician.py   NeuronStatistician           union / intersection / per-task exclusive sets
+│                     StatisticsResult             save_report() + summary() + param_coverage()
+├── deactivator.py    NeuronDeactivator            zero out selected neurons (ablation)
+│                     DeactivationResult
+└── model.py          get_neuron_model             sparse-PEFT wrapper (LinearDeltaSubspace, ...)
+                      CriticalNeuronModel          save / load / merge adapters
+                      freeze_neurons               freeze neurons during full fine-tuning
+                      FrozenNeuronHandle
 ```
 
 All public symbols live on the top-level package:
@@ -53,15 +67,33 @@ All public symbols live on the top-level package:
 from critnet import (
     CriticalNeuronConfig,
     NeuronDetector,
+    DetectionResult,
+    select_neurons_from_cache,
     NeuronStatistician,
     NeuronDeactivator,
     get_neuron_model,
     freeze_neurons,
     CriticalNeuronModel,
+    load_neuron_indices,
+    save_neuron_indices,
 )
 ```
 
 A full API reference (arguments, on-disk formats, edge cases) lives in [`critnet/README.md`](critnet/README.md).
+
+---
+
+## Design at a glance
+
+The toolkit deliberately separates three concerns that early prototypes conflated:
+
+| Concern | Lives on |
+| --- | --- |
+| **Architecture** — which modules carry neurons, how they pair, where embeddings live | `CriticalNeuronConfig` |
+| **Detection-time hyperparameter** — what fraction of neurons to keep this run | argument to `NeuronDetector.detect(..., sparsity_ratio=...)` |
+| **Detection output** — the indices that came out of that run | `DetectionResult` (a plain dataclass) |
+
+The config is therefore reusable across runs at different ratios, and the result is a pure value type that the user is free to ignore, save, mutate, or pass around. No method on the toolkit mutates the config silently.
 
 ---
 
@@ -124,22 +156,19 @@ from critnet import (
 )
 
 model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
 
-cfg_u = CriticalNeuronConfig(sparsity_ratio=P_UTILITY, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_u).detect(build_loader(utility_convs))
+utility = NeuronDetector(model, config).detect(build_loader(utility_convs), sparsity_ratio=P_UTILITY)
+refusal = NeuronDetector(model, config).detect(build_loader(refusal_convs), sparsity_ratio=Q_REFUSAL)
 
-cfg_r = CriticalNeuronConfig(sparsity_ratio=Q_REFUSAL, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_r).detect(build_loader(refusal_convs))
-
-result = NeuronStatistician(model=model, config=cfg_r).analyze(
-    {"utility": cfg_u.neuron_indices, "refusal": cfg_r.neuron_indices}
+stats = NeuronStatistician(model=model, config=config).analyze(
+    {"utility": utility.indices, "refusal": refusal.indices},
 )
-safety_indices = result.exclusive["refusal"]  # N_s = N^q_r \ N^p_u
+safety_indices = stats.exclusive["refusal"]  # N_s = N^q_r \ N^p_u
 print(f"|N_s| = {sum(len(v) for v in safety_indices.values()):,} neurons "
-      f"(~{result.param_coverage(safety_indices):.2f}% of model parameters)")
+      f"(~{stats.param_coverage(safety_indices):.2f}% of model parameters)")
 
-cfg_s = CriticalNeuronConfig(base_model_name_or_path=MODEL, neuron_indices=safety_indices)
-print(NeuronDeactivator(model, cfg_s).deactivate().summary())
+print(NeuronDeactivator(model, config).deactivate(safety_indices).summary())
 
 prompt = "a harmful question."
 inputs = tokenizer.apply_chat_template(
@@ -156,17 +185,18 @@ print(tokenizer.decode(orig.generate(inputs, max_new_tokens=256)[0], skip_specia
 print("\n\n" + "-"*100 + "\n\n")
 ```
 
-You should see roughly **1.64%** of the parameters flagged as safety-specific, the original model refusing the harmful prompt, and the deactivated model complying — empirical confirmation that this small subset causally implements Qwen3-4B-Instruct's safety behaviour.
+You should see roughly **1.64 %** of the parameters flagged as safety-specific, the original model refusing the harmful prompt, and the deactivated model complying — empirical confirmation that this small subset causally implements Qwen3-4B-Instruct's safety behaviour.
 
 ---
 
 ## Workflow at a glance
 
 ```
-Phase 1: Detect        Phase 2: Analyse / Ablate / Freeze            Phase 3: Sparse PEFT          Phase 4: Load or merge
-NeuronDetector   -->   NeuronStatistician                       -->  get_neuron_model        -->   CriticalNeuronModel
-                       NeuronDeactivator                             + HF Trainer                  .from_pretrained
-                       freeze_neurons                                                              .merge_and_unload
+Phase 1: Detect            Phase 2: Analyse / Ablate / Freeze         Phase 3: Sparse PEFT          Phase 4: Load or merge
+NeuronDetector       -->   NeuronStatistician.analyze              -->  get_neuron_model       -->   CriticalNeuronModel
+   .detect()                  -> StatisticsResult                       + HF Trainer                 .from_pretrained
+DetectionResult            NeuronDeactivator.deactivate                                              .merge_and_unload
+select_neurons_from_cache  freeze_neurons -> FrozenNeuronHandle
 ```
 
-Every phase consumes the same `CriticalNeuronConfig` + `neuron_indices.json` artefact, so you can enter at any step once detection is cached. The Quickstart above uses Phases 1 → 2 (detect, analyse, deactivate). For **sparse PEFT** (Phase 3, sparse delta-tuning as a LoRA alternative) and **freeze-tuning** (Phase 2c), plus full argument-level documentation and on-disk formats, see [`critnet/README.md`](critnet/README.md).
+Every phase consumes the same `CriticalNeuronConfig` + `neuron_indices.json` pair on disk, so you can enter at any step once detection is cached. The Quickstart above uses Phases 1 → 2 (detect, analyse, deactivate). For **sparse PEFT** (Phase 3, sparse delta-tuning as a LoRA alternative) and **freeze-tuning** (Phase 2c), plus full argument-level documentation and on-disk formats, see [`critnet/README.md`](critnet/README.md).

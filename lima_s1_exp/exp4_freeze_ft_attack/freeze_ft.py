@@ -90,9 +90,8 @@ def main() -> None:
     with open(args.freeze_neurons_path, "r", encoding="utf-8") as f:
         freeze_indices = json.load(f)
 
-    config = CriticalNeuronConfig()
-    frozen_handle = freeze_neurons(model, freeze_indices, config)
-    frozen_handle.print_frozen_summary()
+    frozen_handle = freeze_neurons(model, freeze_indices, CriticalNeuronConfig())
+    print(frozen_handle.summary())
 
     hf_parser = transformers.HfArgumentParser(TrainingArguments)
     cfg = OmegaConf.load(args.training_config)

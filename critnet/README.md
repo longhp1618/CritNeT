@@ -2,7 +2,7 @@
 
 This is the per-symbol reference for the `critnet` package. For installation, repository layout, and a runnable Quickstart, see the root [README.md](../README.md).
 
-> **TL;DR.** `critnet` ranks every "neuron" (row / column of a linear layer, or scalar of a norm) by the first-order Taylor importance $|w \odot \nabla_w \mathcal{L}|$, then lets you act on the global top-$k$ set: **analyse**, **deactivate**, **freeze**, or **fine-tune only those neurons**. One config object (`CriticalNeuronConfig`) describes the targeted modules and the sparsity ratio; every other class consumes it.
+> **TL;DR.** `critnet` ranks every "neuron" (row / column of a linear layer, or scalar of a norm) by the first-order Taylor importance $|w \odot \nabla_w \mathcal{L}|$, then lets you act on the global top-$k$ set: **analyse**, **deactivate**, **freeze**, or **fine-tune only those neurons**. One `CriticalNeuronConfig` describes the targeted modules; the per-run `sparsity_ratio` lives on `NeuronDetector.detect(...)`; the per-run indices live on a `DetectionResult`. Nothing else holds hidden state.
 
 **Dependencies:** `torch`, `transformers`, `tqdm`. `safetensors` is optional (adapter and deactivated-checkpoint I/O fall back to `torch.save` when it is missing).
 
@@ -10,31 +10,40 @@ This is the per-symbol reference for the `critnet` package. For installation, re
 
 ## Contents
 
-1. [The five public components](#the-five-public-components)
+1. [Public symbols at a glance](#public-symbols-at-a-glance)
 2. [How importance scoring works](#how-importance-scoring-works)
 3. [`CriticalNeuronConfig`](#criticalneuronconfig)
-4. [`NeuronDetector`](#neurondetector)
-5. [`NeuronStatistician` and `StatisticsResult`](#neuronstatistician-and-statisticsresult)
-6. [`NeuronDeactivator` and `DeactivationResult`](#neurondeactivator-and-deactivationresult)
-7. [`get_neuron_model`, `CriticalNeuronModel`, delta wrappers](#get_neuron_model-criticalneuronmodel-delta-wrappers)
-8. [`freeze_neurons` and `FrozenNeuronHandle`](#freeze_neurons-and-frozenneuronhandle)
-9. [Saved-artefact layout](#saved-artefact-layout)
-10. [Cookbook](#cookbook)
+4. [`NeuronDetector` and `DetectionResult`](#neurondetector-and-detectionresult)
+5. [`select_neurons_from_cache`](#select_neurons_from_cache)
+6. [`NeuronStatistician` and `StatisticsResult`](#neuronstatistician-and-statisticsresult)
+7. [`NeuronDeactivator` and `DeactivationResult`](#neurondeactivator-and-deactivationresult)
+8. [`get_neuron_model`, `CriticalNeuronModel`, delta wrappers](#get_neuron_model-criticalneuronmodel-delta-wrappers)
+9. [`freeze_neurons` and `FrozenNeuronHandle`](#freeze_neurons-and-frozenneuronhandle)
+10. [Saved-artefact layout](#saved-artefact-layout)
+11. [Cookbook](#cookbook)
 
 ---
 
-## The five public components
+## Public symbols at a glance
 
 ```python
 from critnet import (
-    CriticalNeuronConfig,    # shared config: targeted modules + sparsity_ratio + neuron_indices
-    NeuronDetector,          # 1. detect critical neurons for a corpus
-    NeuronStatistician,      # 2. set-algebra (union / intersection / exclusive) across runs
-    NeuronDeactivator,       # 3. zero out a neuron set in place (ablation)
-    get_neuron_model,        # 4. wrap a model so only critical-neuron deltas train (sparse PEFT)
-    freeze_neurons,          # 5. freeze a neuron set during full fine-tuning
-    # supporting symbols
-    StatisticsResult, DeactivationResult, CriticalNeuronModel, FrozenNeuronHandle,
+    # Architectural config + index I/O
+    CriticalNeuronConfig,
+    save_neuron_indices, load_neuron_indices,
+
+    # Detection
+    NeuronDetector, DetectionResult, select_neurons_from_cache,
+
+    # Set algebra
+    NeuronStatistician, StatisticsResult,
+
+    # In-place ablation
+    NeuronDeactivator, DeactivationResult,
+
+    # Sparse PEFT + freezing
+    get_neuron_model, CriticalNeuronModel,
+    freeze_neurons, FrozenNeuronHandle,
     DEFAULT_SKIP_MODULES,
     LinearDeltaSubspace, NormDeltaSubspace, EmbeddingDeltaSubspace,
 )
@@ -43,15 +52,19 @@ from critnet import (
 Every workflow follows the same shape:
 
 ```
-build CriticalNeuronConfig  →  NeuronDetector.detect(loader)  →  cfg.neuron_indices is filled
-                                                              ↓
-                  ┌───────────────────────────────────────────┼──────────────────────────────┐
-                  ↓                                           ↓                              ↓
-          NeuronStatistician                          NeuronDeactivator              get_neuron_model
-          (compare across runs)                       (zero out, save HF ckpt)       (train only deltas)
-                                                                                            +
-                                                                                     freeze_neurons
-                                                                                     (full FT, mask grads)
+build CriticalNeuronConfig
+    │
+    ▼
+NeuronDetector(model, config).detect(loader, sparsity_ratio=...)  ─┐
+                                                                    ├─►  DetectionResult
+select_neurons_from_cache(cache_path, config, sparsity_ratio=...)  ─┘     (.indices, .sparsity_ratio,
+                                                                            .gate_to_partner_path)
+    │
+    └─► result.indices is then consumed by ONE of:
+            NeuronStatistician.analyze(...)         → StatisticsResult.save_report(dir)
+            NeuronDeactivator.deactivate(indices)   → DeactivationResult
+            get_neuron_model(model, config, indices) → CriticalNeuronModel  (+ HF Trainer)
+            freeze_neurons(model, indices, config)  → FrozenNeuronHandle    (+ HF Trainer)
 ```
 
 ---
@@ -60,13 +73,13 @@ build CriticalNeuronConfig  →  NeuronDetector.detect(loader)  →  cfg.neuron_
 
 ### Per-neuron importance
 
-For each targeted parameter tensor `W`, the detector computes the elementwise product $|W \odot \nabla_W \mathcal{L}|$ and **reduces it to one scalar per neuron** based on the module type:
+For each targeted parameter tensor $W$, the detector computes the elementwise product $|W \odot \nabla_W \mathcal{L}|$ and **reduces it to one scalar per neuron** based on the module type:
 
 | Module type | What is a "neuron"? | Reduction |
 |-------------|--------------------|-----------|
 | **row** (`q_proj`, `up_proj`, …) | one **row** of $W$ — an output channel | sum over the input dim |
 | **column** (`o_proj`, `down_proj`) | one **column** of $W$ — an input channel | sum over the output dim |
-| **norm** (`input_layernorm`, …) | one scalar of the 1-D weight | identity (`|w_i · grad_i|`) |
+| **norm** (`input_layernorm`, …) | one scalar of the 1-D weight | identity ($\|w_i \cdot \nabla w_i\|$) |
 | **embedding** (opt-in) | one **row** of the embedding (a vocab item) | sum over the embed dim |
 
 ### Global top-$k$ selection
@@ -79,472 +92,442 @@ k = max(1, int(total_neuron_count * sparsity_ratio))
 
 neurons survive. `sparsity_ratio` is therefore a **fraction of pooled neurons across the whole model**, not a per-layer fraction. This naturally lets attention QKV neurons compete with FFN gate/up/down neurons on the same scale.
 
-### SwiGLU gate handling
+### Gate / partner combination (SwiGLU)
 
-LLaMA-style FFNs compute `down( gate(x) * up(x) )`. Ablating only `up_proj` row $i$ without ablating the same row of `gate_proj` would leave a stale gate signal. `gate_combines_with = {"gate_proj": "up_proj"}` (the default) handles this:
+In SwiGLU MLPs, `gate_proj` and `up_proj` are multiplied element-wise inside the activation, so picking row $i$ of one without the corresponding row $i$ of the other is rarely meaningful. The default config sets
 
-1. The `gate_proj` score vector is **added** to its partner's before top-$k$.
-2. The gate entry is removed from the score dict.
-3. After selection, `gate_proj` receives a **copy** of `up_proj`'s selected indices.
+```python
+gate_combines_with = {"gate_proj": "up_proj"}
+```
 
-Result: gate and up rows are always selected as a pair.
+which makes the detector:
 
-### Gradients accumulate inside `detect`
+1. Add `gate_proj`'s row-scores into `up_proj`'s scores element-wise **before** top-$k$.
+2. Mirror the resulting `up_proj` selection back onto `gate_proj` so the two modules share their selected indices.
 
-`NeuronDetector.detect` calls `model.zero_grad()` **once** at the start, then loops `loss.backward()` per batch **without zeroing between batches**. The importance step uses these accumulated gradients, which is mathematically equivalent to computing the gradient of the summed loss over the whole calibration corpus.
-
-Label masking is **not** done by `detect`. Your dataset / collator is responsible for producing the right `labels`: set them to `-100` on prompt positions for chat SFT (so only completion tokens contribute to the loss), or equal to `input_ids` for pre-training (next-token prediction on every token).
+This both halves the search space and guarantees that any active gate row has a matching up row.
 
 ---
 
 ## `CriticalNeuronConfig`
 
-The single shared configuration object. Lives in `config.py`. Stores **which modules to target**, the **sparsity ratio**, and (after detection) the selected **neuron indices**.
+```python
+from critnet import CriticalNeuronConfig
+```
 
-Module matching is by **leaf name**: `"q_proj"` matches every fully-qualified path that ends in `q_proj`, e.g. `model.layers.0.self_attn.q_proj`.
+`CriticalNeuronConfig` is the single source of truth for **which modules** are candidates. It carries no detection hyperparameters and no detection output; those belong on `NeuronDetector.detect` / `DetectionResult`.
 
 ### Fields
 
-| Field | Type | Default / behavior |
-|-------|------|---------------------|
-| `row_modules` | `list[str] \| None` | `None` → `["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]`. |
-| `column_modules` | `list[str] \| None` | `None` → `["o_proj", "down_proj"]`. |
-| `norm_modules` | `list[str] \| None` | `None` → `["input_layernorm", "post_attention_layernorm"]`. |
-| `embedding_modules` | `list[str] \| None` | `None` (off). Pass a list to opt in; `[]` keeps it off. |
-| `sparsity_ratio` | `float` | `0.05`. Must be strictly in $(0, 1)$. |
-| `gate_combines_with` | `dict[str, str] \| None` | `None` → `{"gate_proj": "up_proj"}` if both are in the linear lists. `{}` disables. |
-| `neuron_indices` | `dict[str, list[int]] \| None` | Filled by `NeuronDetector` or `from_pretrained`. |
-| `base_model_name_or_path` | `str \| None` | Optional metadata for downstream tools. |
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `row_modules` | `list[str] \| None` | `["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]` | Linear layers where rows are neurons. |
+| `column_modules` | `list[str] \| None` | `["o_proj", "down_proj"]` | Linear layers where columns are neurons. |
+| `norm_modules` | `list[str] \| None` | `["input_layernorm", "post_attention_layernorm"]` | 1-D norm weights — each scalar is one neuron. |
+| `embedding_modules` | `list[str] \| None` | `None` | Embedding layers (rows = vocab items). Opt-in. |
+| `gate_combines_with` | `dict[str, str] \| None` | `{"gate_proj": "up_proj"}` (when both are targeted) | SwiGLU pairing. |
+| `base_model_name_or_path` | `str \| None` | `None` | Metadata used by `CriticalNeuronModel.from_pretrained` as a fallback. |
 
-### Smart defaults
-
-- Passing `None` for a module list → fill with architecture defaults (LLaMA / Mistral / Qwen share the same leaf names).
-- Passing `[]` → explicitly empty (e.g. `norm_modules=[]` skips all norms).
-- `embedding_modules` stays `None` unless you set it.
-
-For **Qwen-3 / 3.5** add the QK norms:
-
-```python
-CriticalNeuronConfig(
-    norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],
-)
-```
-
-### Validation (`__post_init__`)
-
-- `sparsity_ratio` must be in $(0, 1)$.
-- A module suffix may appear in **at most one** of the four category lists.
-- Every key and value of `gate_combines_with` must be in `row_modules` or `column_modules`.
+Any field left as `None` is replaced by a sensible LLaMA / Mistral / Qwen default in `__post_init__`. Pass an explicit empty list (`[]`) to opt out entirely.
 
 ### Methods
 
-| Method | Purpose |
-|--------|---------|
-| `target_modules` (property) | Flat union of all four category lists. |
-| `linear_modules` (property) | `row_modules + column_modules`. |
-| `matches_target(path) -> bool` | Does this leaf name belong to any category? |
-| `get_module_type(path) -> str` | Returns `"row" / "column" / "norm" / "embedding"`; raises `ValueError` otherwise. |
-| `summary() -> str` | Human-readable dump. |
-| `save_pretrained(dir)` | Writes `critical_neuron_config.json` (+ `neuron_indices.json` if present). |
-| `from_pretrained(dir)` | Class method; restores config and (optionally) neuron indices. |
+- **`classify(name) -> Optional[str]`** — single source of truth for module typing. Returns `"row"`, `"column"`, `"norm"`, `"embedding"`, or `None` based on the *leaf* component of `name`.
+- **`target_modules`** — flat list of every targeted suffix.
+- **`linear_modules`** — `row_modules + column_modules`.
+- **`save_pretrained(save_directory, *, indices=None)`** — writes `critical_neuron_config.json`; also writes `neuron_indices.json` when `indices` is provided.
+- **`CriticalNeuronConfig.from_pretrained(load_directory)`** — load the config (only; use `load_neuron_indices` for the indices).
+- **`summary() -> str`** — human-readable formatting.
 
-> `embed_tokens` and `lm_head` are **not** excluded by the config itself. They are skipped by `get_neuron_model` via `DEFAULT_SKIP_MODULES` (see below) to avoid breaking weight-tying and fused-kernel paths.
+### Index I/O helpers (free functions)
+
+```python
+from critnet import save_neuron_indices, load_neuron_indices
+
+save_neuron_indices("./neurons", indices)            # writes neuron_indices.json
+indices = load_neuron_indices("./neurons")           # reads neuron_indices.json
+```
+
+These are deliberately separate from the config so neither owns the other.
 
 ---
 
-## `NeuronDetector`
-
-Computes per-neuron importance scores from a calibration loader and picks the global top-$k$.
+## `NeuronDetector` and `DetectionResult`
 
 ```python
-NeuronDetector(model: nn.Module | None, config: CriticalNeuronConfig)
+from critnet import NeuronDetector
 ```
 
-- `model` is required for `.detect(...)`. It is **optional** when you only call `.select_from_importance_cache(...)` on a previously saved scores blob.
-
-### `detect(dataloader, save_importance_cache_path=None)`
-
-Runs the calibration pass and returns `dict[module_path, sorted list[int]]`. Also stores the result on `self.config.neuron_indices` so you can immediately `config.save_pretrained(...)`.
-
-| Argument | Description |
-|----------|-------------|
-| `dataloader` | Each batch must be a `dict` containing at least `input_ids`, `attention_mask`, and `labels`. See [Gradients accumulate inside `detect`](#gradients-accumulate-inside-detect) for how `labels` should be prepared by your dataset / collator. |
-| `save_importance_cache_path` | If set, saves the **post–gate-combined** per-module score tensors so you can re-select with a different `sparsity_ratio` without rerunning the backward pass. |
-
-### `save(save_path)`
-
-Convenience wrapper around `config.save_pretrained(save_path)`.
-
-### `select_from_importance_cache(path)`
-
-Loads a cached scores blob and reapplies global top-$k$ using **the current `config.sparsity_ratio`**. Useful for sweeping ratios cheaply.
+### Constructor
 
 ```python
-cfg = CriticalNeuronConfig(sparsity_ratio=0.05)
-det = NeuronDetector(model, cfg)
-det.detect(loader, save_importance_cache_path="./cache.pt")  # expensive once
-
-for r in [0.01, 0.02, 0.05, 0.10]:
-    cfg.sparsity_ratio = r
-    det.select_from_importance_cache("./cache.pt")           # cheap
-    cfg.save_pretrained(f"./neurons/r{r}")
+NeuronDetector(model: nn.Module, config: CriticalNeuronConfig)
 ```
 
-### `save_importance_cache(combined_scores, path)` (low-level)
+`model` is required. Passing `None` raises `TypeError` — use `select_neurons_from_cache` for cache-only runs.
 
-Normally invoked indirectly via `save_importance_cache_path` on `.detect(...)`. See [Saved-artefact layout](#saved-artefact-layout) for the on-disk format.
+### `detect(...)`
+
+```python
+result = detector.detect(
+    dataloader,
+    *,
+    sparsity_ratio: float,
+    save_importance_cache_path: Optional[str] = None,
+) -> DetectionResult
+```
+
+- **`dataloader`** — each batch must be a `dict` with at least `input_ids`, `attention_mask`, and `labels`. The collator is responsible for label preparation: mask prompt tokens to `-100` for chat SFT, or set `labels == input_ids` for pre-training.
+- **`sparsity_ratio`** — fraction of pooled neurons across the whole model. Strictly in $(0, 1]$. Validated.
+- **`save_importance_cache_path`** — when set, the post-gate-combined score tensors and gate map are pickled with `torch.save`, so a later run can call `select_neurons_from_cache` at a different ratio without the backward pass.
+
+`detect()` is **non-mutating** to the caller's perspective:
+
+- `model.training` and the `requires_grad` flags of every target parameter are snapshotted and restored on exit.
+- `model.zero_grad()` is called before and after the backward loop.
+- The caller's config is unchanged. The selected indices live only on the returned `DetectionResult`.
+
+### `DetectionResult`
+
+```python
+@dataclass
+class DetectionResult:
+    indices: dict[str, list[int]]
+    sparsity_ratio: float
+    gate_to_partner_path: dict[str, str]
+```
+
+- `result.total_selected` — sum of every selected index across modules.
+- `result.n_modules` — number of modules that received at least one index.
+- `result.summary()` — one-line string.
+
+To persist a result:
+
+```python
+config.save_pretrained("./neurons", indices=result.indices)
+```
+
+---
+
+## `select_neurons_from_cache`
+
+```python
+from critnet import select_neurons_from_cache
+
+result = select_neurons_from_cache(
+    cache_path: str,
+    config: CriticalNeuronConfig,
+    *,
+    sparsity_ratio: float,
+) -> DetectionResult
+```
+
+Replays the global top-$k$ from a previously saved importance cache without loading a model. Cheap; safe to call in a tight loop while sweeping `sparsity_ratio`. The cache is the file written by `detect(..., save_importance_cache_path=...)`.
 
 ---
 
 ## `NeuronStatistician` and `StatisticsResult`
 
-Set-algebra across two or more detection runs. The classic use is comparing neuron sets for different tasks or languages.
-
 ```python
-NeuronStatistician(model: nn.Module | None = None, config: CriticalNeuronConfig | None = None)
+from critnet import NeuronStatistician
 ```
 
-- Pass `model` so neuron totals and `param_coverage(...)` can use real weight shapes.
-- Pass `config` so `get_module_type` resolves row vs column vs norm during counting.
-- Both `None` is allowed (CPU-only stats), but `total_neurons_per_module`, `params_per_neuron`, and `total_model_params` will be empty / zero.
-
-### `analyze(task_indices) -> StatisticsResult`
-
 ```python
-task_indices: dict[
-    str,                       # task / language name, e.g. "utility", "refusal", "en", "zh"
-    dict[str, list[int]],      # the inner neuron_indices dict for that task
-]
+stats = NeuronStatistician(model=model, config=config)
+result = stats.analyze({
+    "utility": utility_result.indices,
+    "refusal": refusal_result.indices,
+})
+result.save_report("./statistics")
 ```
 
-Per module, computes:
+Both `model` and `config` are optional. Without `model` you still get the union / intersection / exclusive / non-shared sets — but parameter coverage numbers will be zero (the statistician needs the real weight shapes to compute them).
 
-- **`union`** — neurons that appear in **any** task.
-- **`intersection`** — neurons that appear in **all** tasks ("shared").
-- **`exclusive[task]`** — `task`'s set minus the intersection. *(Note: this is **task − shared**, not pairwise set-difference. For two tasks `A` and `B`, `exclusive["A"] = A \ B`. For three or more, `exclusive["A"]` is everything in `A` that is not in `A ∩ B ∩ C`.)*
-- **`non_shared`** — `union ∖ intersection`.
+### Computed sets
 
-### `save_report(save_directory)`
+For each targeted module path $m$ and tasks $T = \{t_1, \dots, t_n\}$:
 
-After `analyze`, writes (see [Saved-artefact layout](#saved-artefact-layout)):
-`union_neurons.json`, `shared_neurons.json`, `non_shared_neurons.json`, `exclusive_<task>_neurons.json` (one per task), and `statistics.csv`.
+| Field on `StatisticsResult` | Definition |
+|---|---|
+| `union[m]` | $\bigcup_{t} N_t(m)$ |
+| `intersection[m]` | $\bigcap_{t} N_t(m)$ |
+| `non_shared[m]` | `union[m] - intersection[m]` |
+| `exclusive[t][m]` | $N_t(m) \setminus \bigcap_{t'} N_{t'}(m)$ |
+| `task_indices[t][m]` | the original $N_t(m)$, kept for reporting |
 
-### `StatisticsResult` fields
+### Properties / methods
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `union` | `dict[str, list[int]]` | Per-module union. |
-| `intersection` | `dict[str, list[int]]` | Per-module intersection. |
-| `exclusive` | `dict[str, dict[str, list[int]]]` | Outer key = task name. |
-| `non_shared` | `dict[str, list[int]]` | Union minus intersection. |
-| `total_neurons_per_module` | `dict[str, int]` | Total neurons per module (needs `model`). |
-| `params_per_neuron` | `dict[str, int]` | Scalar weights touched by one neuron index. |
-| `total_model_params` | `int` | Full parameter count (needs `model`). |
-| `task_names` | `list[str]` | Insertion order of tasks. |
+- `union_count`, `intersection_count`, `non_shared_count` — aggregate scalar counts.
+- `task_count(t)`, `exclusive_count(t)` — per-task counts.
+- `total_neurons_per_module` and `params_per_neuron` — derived from real weight shapes when `model` is set.
+- `total_model_params` — `sum(p.numel() for p in model.parameters())`.
+- **`param_coverage(indices) -> float`** — % of model parameters covered by an arbitrary indices dict.
+- **`summary() -> str`** — formatted report with per-task lines.
+- **`save_report(save_directory) -> None`** — writes `union_neurons.json`, `shared_neurons.json`, `non_shared_neurons.json`, one `exclusive_<task>_neurons.json` per task, and `statistics.csv`.
 
-Properties: `union_count`, `intersection_count`, `non_shared_count`, `total_neurons`.
-
-Methods:
-
-- `exclusive_count(task) -> int`
-- `task_count(task, task_indices) -> int`
-- `param_coverage(indices) -> float` — **percentage** (0–100) of total model parameters covered by `indices`.
-- `summary(task_indices=None) -> str` — text report; pass `task_indices` for per-task lines.
+The statistician is stateless across `analyze` calls; you can reuse one instance for many runs.
 
 ---
 
 ## `NeuronDeactivator` and `DeactivationResult`
 
-Zero out a neuron set **in place** in the underlying weights. Useful for ablation studies — the model architecture is unchanged, so a deactivated model is just a normal HuggingFace checkpoint that can be saved and reloaded as usual.
-
 ```python
-NeuronDeactivator(model: nn.Module, config: CriticalNeuronConfig)
+from critnet import NeuronDeactivator
+
+deactivator = NeuronDeactivator(model, config)
+result = deactivator.deactivate(indices)
+print(result.summary())
+deactivator.save_pretrained("./deactivated_model", tokenizer=tokenizer, indices=indices)
 ```
 
-The model must be a plain HF-style stack (not wrapped by `CriticalNeuronModel`). The config supplies module categories so the deactivator knows **which axis** to zero.
+### `deactivate(indices) -> DeactivationResult`
 
-### `deactivate(neuron_indices=None) -> DeactivationResult`
+Zeroes the chosen neurons **in place** on the model's weight tensors. Per module type:
 
-Uses `neuron_indices` if passed, else `config.neuron_indices`. The effect per module type:
+| Type | Action |
+|---|---|
+| `"row"` | `W[idx, :] = 0` |
+| `"column"` | `W[:, idx] = 0` |
+| `"norm"` | `w[idx] = 0` (and `bias[idx] = 0` when present) |
+| `"embedding"` | `E[idx, :] = 0` |
 
-| Module type | Effect |
-|-------------|--------|
-| **row** | `W[idx, :] = 0` |
-| **column** | `W[:, idx] = 0` |
-| **norm** | `w[idx] = 0`; `bias[idx] = 0` if present |
-| **embedding** | `E[idx, :] = 0` |
+**Strict.** If any module path in `indices` cannot be classified by `config.classify(...)`, `deactivate` raises `ValueError` with the offending paths. Silent mis-classification was the old default and could zero the wrong axis.
 
-Unknown modules are skipped with a warning.
+### `DeactivationResult`
 
-### `save_pretrained(save_directory, tokenizer=None)`
+`modules_affected`, `neurons_zeroed`, `total_weights_zeroed`, `per_module` (a dict per touched module), and `summary()`.
 
-Calls `model.save_pretrained`, optionally `tokenizer.save_pretrained`, plus `config.save_pretrained`. The result is loadable with `AutoModelForCausalLM.from_pretrained` just like any other checkpoint.
+### `save_pretrained(save_directory, *, tokenizer=None, indices=None)`
 
-### `DeactivationResult` fields
-
-| Field | Meaning |
-|-------|---------|
-| `modules_affected` | Count of modules touched. |
-| `neurons_zeroed` | Count of neuron indices processed. |
-| `total_weights_zeroed` | Scalar weight elements set to zero. |
-| `per_module[path]` | `{"neurons", "weights", "module_type"}`. |
-
-`.summary() -> str` prints aggregate counts.
+Convenience over the three explicit calls (`model.save_pretrained`, `tokenizer.save_pretrained`, `config.save_pretrained(..., indices=...)`). Useful when you want a single drop-in directory.
 
 ---
 
 ## `get_neuron_model`, `CriticalNeuronModel`, delta wrappers
 
-Sparse PEFT: keep the base weights frozen and learn a **small additive delta** restricted to selected neuron indices. Drop-in alternative to LoRA when you already have a `neuron_indices` dict.
+### `get_neuron_model(model, config, indices, *, modules_to_skip=None) -> CriticalNeuronModel`
 
-### `get_neuron_model(model, config, modules_to_skip=None) -> CriticalNeuronModel`
+Walks `model.named_modules()`, replaces every module path in `indices` with the appropriate delta wrapper, freezes every base parameter, unfreezes only the wrapper's `dW`, and (when the model exposes it) calls `enable_input_require_grads()` for gradient checkpointing.
 
-| Argument | Description |
-|----------|-------------|
-| `model` | Any HF model with `nn.Linear` / norm targets (e.g. `AutoModelForCausalLM`). |
-| `config` | Must have a non-`None` `neuron_indices`. |
-| `modules_to_skip` | Set of **leaf** names skipped from wrapping. Default `DEFAULT_SKIP_MODULES = {"lm_head", "embed_tokens"}` to avoid breaking fused kernels and weight-tying. Pass `set()` to override. |
-
-Wrapping rules: a module is replaced iff it (1) matches the config's targets, (2) is **not** in `modules_to_skip`, (3) appears in `neuron_indices`, and (4) has a non-empty index list. Replacement uses `LinearDeltaSubspace`, `NormDeltaSubspace`, or `EmbeddingDeltaSubspace` based on `get_module_type`. After wrapping:
-
-- All parameters get `requires_grad_(False)`.
-- Each wrapper's `dW` gets `requires_grad_(True)`.
-- `model.enable_input_require_grads()` is called when available (so gradient checkpointing still works).
-
-### `LinearDeltaSubspace(base_linear, indices, mode="row", train_bias=False)`
-
-Behaves like an `nn.Linear` from the outside (`weight`, `bias`, `in_features`, `out_features` are exposed via properties).
-
-| `mode` | `dW` shape | Forward |
-|--------|-----------|---------|
-| `"row"` | `[k, in_features]` | `y = base(x); y.index_add_(-1, idx, x @ dW.T)` |
-| `"column"` | `[out_features, k]` | `y = base(x) + (x[..., idx] @ dW.T)` |
-
-- `train_bias=False` freezes the base bias when present.
-- `merge_to_linear_()` adds `dW` into the base weight in place and returns a plain `nn.Linear`.
-
-### `NormDeltaSubspace(base_norm, indices)`
-
-Forward applies a multiplicative-style correction on selected positions of the 1-D norm weight. `merge_to_norm_()` adds `dW` into the base weight.
-
-### `EmbeddingDeltaSubspace(base_embedding, indices)`
-
-Trainable delta restricted to selected vocabulary rows. `merge_to_embedding_()` merges into `base_embedding.weight`.
+- `indices` must include only modules that the config classifies. Otherwise `ValueError` is raised (no fallback guess on the axis).
+- `modules_to_skip` defaults to `DEFAULT_SKIP_MODULES = {"lm_head", "embed_tokens"}` to avoid breaking fused kernels and weight-tying. Pass `set()` to override.
+- Every key in `indices` must be a real `named_modules()` path. Unknown paths raise.
 
 ### `CriticalNeuronModel`
 
-Thin `nn.Module` around the wrapped inner model. Compatible with `transformers.Trainer` thanks to `__getattr__` proxying.
+A thin `nn.Module` wrapper. Forwards every call to the inner model and adds:
 
-| Attribute | Description |
-|-----------|-------------|
-| `model` | The inner HF model. |
-| `peft_config` | The `CriticalNeuronConfig` used for wrapping. |
+- `model.neuron_indices` — live `dict[str, list[int]]` view (reads back from the wrappers).
+- `model.config` — the public alias of the config. `model.peft_config` is the **HF-Trainer-compat alias** for the same object.
+- `model.save_pretrained(save_directory)` — writes:
+  - `adapter_model.safetensors` (`dW` and `idx` for every wrapper); falls back to `adapter_model.pt`.
+  - `critical_neuron_config.json` + `neuron_indices.json`.
+- `model.from_pretrained(adapter_path, *, base_model_name_or_path=None, model_kwargs=None, modules_to_skip=None)` — loads a saved adapter on top of a fresh base model. If `base_model_name_or_path` is `None`, it is read from the saved config; raising if absent.
+- `model.merge_and_unload() -> nn.Module` — merges every `dW` into the base weights in place and returns the plain `nn.Module` (no wrappers left).
+- `model.print_trainable_parameters()` — PEFT-style summary.
 
-| Method | Description |
-|--------|-------------|
-| `forward`, `generate` | Delegated to `model`. |
-| `get_adapter_state_dict()` | OrderedDict of `*.dW` and `*.idx` from every delta module. |
-| `save_pretrained(save_directory, **kwargs)` | Writes the adapter + config JSONs (see on-disk layout). |
-| `from_pretrained(adapter_path, base_model_name_or_path=None, model_kwargs=None, modules_to_skip=None)` | Class method. Loads the base model, calls `get_neuron_model`, then loads `dW` from the adapter file. `base_model_name_or_path` falls back to the value recorded in `adapter_path/critical_neuron_config.json` when omitted. |
-| `merge_and_unload()` | In-place merge of every delta wrapper; returns the inner plain `nn.Module`. |
-| `print_trainable_parameters()` | Prints trainable / total parameter counts. |
+### Delta wrappers (advanced)
+
+`LinearDeltaSubspace(base_linear, indices, mode={"row", "column"}, train_bias=False)`,
+`NormDeltaSubspace(base_norm, indices)`,
+`EmbeddingDeltaSubspace(base_embedding, indices)`.
+
+All three:
+
+- expose a 1-D `idx` buffer and a 2-D `dW` parameter,
+- preserve the base module's surface (`.weight`, `.bias`, `.in_features`, …),
+- have an in-place `merge_to_*_()` method that bakes `dW` into the base and returns the plain module.
+
+With `dW = 0`, every wrapper is the identity on the forward pass.
 
 ---
 
 ## `freeze_neurons` and `FrozenNeuronHandle`
 
-Opposite of sparse PEFT: do **full** fine-tuning but block gradient flow into a chosen neuron set (typically the safety-critical ones).
-
 ```python
-freeze_neurons(
-    model: nn.Module,
-    neuron_indices: dict[str, list[int]],
-    config: CriticalNeuronConfig | None = None,
-) -> FrozenNeuronHandle
+from critnet import freeze_neurons
+
+handle = freeze_neurons(model, indices, config)
+print(handle.summary())
+
+trainer = transformers.Trainer(
+    model=model,
+    args=training_args,
+    callbacks=[handle.make_trainer_callback()],
+    ...
+)
+trainer.train()
+handle.remove()
 ```
 
-| Argument | Description |
-|----------|-------------|
-| `model` | A trainable model (typically every parameter has `requires_grad=True`). |
-| `neuron_indices` | Mapping from module path to indices to **freeze** (no gradient updates). |
-| `config` | Optional; used for row/column/norm typing. A default config is constructed if omitted, and any module not covered by it falls back to heuristics on the leaf name. |
+Registers a backward hook on each affected weight tensor that zeroes the gradient slice corresponding to one frozen neuron. The forward pass is **unchanged**; the model remains structurally identical.
 
-The implementation registers **backward hooks** that zero the gradient slices of frozen neurons. The forward pass is unchanged, so there is zero runtime overhead.
+### Strictness
 
-> **Supported module types:** `nn.Linear` (row/column) and 1-D norm weights. Embedding-row freezing is **not** wired into the current loop — do not pass embedding indices into `freeze_neurons` until this is fixed.
+`freeze_neurons` is strict to avoid wrong-axis surprises:
 
-### `FrozenNeuronHandle`
+1. If `config.classify(name)` returns a known type, that type is used.
+2. Otherwise, if the module is structurally a 1-D norm (1-D `.weight` and a class name containing `norm`/`layernorm`/`rmsnorm`), it is auto-classified as `"norm"`. Norms have no axis ambiguity, so this fallback is safe.
+3. Otherwise `freeze_neurons` raises `ValueError` — there is no `"row"` guess for `nn.Linear`. Add the leaf name to your config's category lists explicitly.
 
-| Member | Description |
-|--------|-------------|
-| `n_frozen` | Count of frozen **scalar** weight elements (for logging). |
-| `n_total` | Total model parameter count. |
-| `restore_frozen_weights()` | Restores saved slices of frozen neurons. Call **after every optimizer step** when `weight_decay > 0`; not needed otherwise. |
-| `remove()` | Detach all hooks (effectively un-freezes the neurons). |
-| `make_trainer_callback()` | Returns a HuggingFace `TrainerCallback` that calls `restore_frozen_weights` on `on_step_end`. |
-| `print_frozen_summary()` | Prints frozen vs trainable counts. |
+### Handle methods
+
+- `handle.restore_frozen_weights()` — re-write the frozen weight slices back to their pre-training values. Use after every optimiser step when `weight_decay > 0`.
+- `handle.remove()` — detach every registered hook.
+- `handle.make_trainer_callback()` — returns an HF `TrainerCallback` that calls `restore_frozen_weights` at every `on_step_end`. Hand it to `Trainer(callbacks=[...])`.
+- `handle.summary()` — one-line "frozen / trainable / all" formatted string.
 
 ---
 
 ## Saved-artefact layout
 
-All save / load methods are versioned-by-filename so directories can be passed around freely.
+```
+<save_directory>/
+├── critical_neuron_config.json     # CriticalNeuronConfig fields
+├── neuron_indices.json             # {module_path: [neuron_idx, ...]}
+├── adapter_model.safetensors       # ONLY for CriticalNeuronModel; dW + idx
+│   (or adapter_model.pt)
+└── statistics.csv, *_neurons.json  # ONLY for StatisticsResult.save_report
+```
 
-### `CriticalNeuronConfig.save_pretrained` / `from_pretrained`
-
-A config directory may contain:
-
-| File | Content |
-|------|---------|
-| `critical_neuron_config.json` | All category lists + `sparsity_ratio` + `gate_combines_with` + `base_model_name_or_path`. **Does not** include neuron indices. |
-| `neuron_indices.json` | Optional. `dict[module_path, list[int]]` — keys are full module paths. |
-
-`NeuronDetector.save(path)` is shorthand for `config.save_pretrained(path)`.
-
-### Adapter checkpoint (`CriticalNeuronModel.save_pretrained`)
-
-| File | Content |
-|------|---------|
-| `adapter_model.safetensors` | Preferred. Keys: `{module_path}.dW` and `{module_path}.idx`. |
-| `adapter_model.pt` | Used when `safetensors` is not installed. |
-| `critical_neuron_config.json`, `neuron_indices.json` | As above. |
-
-### Importance cache (`NeuronDetector.save_importance_cache`)
-
-A `torch.save` blob with:
-
-- `version` (int)
-- `scores`: `dict[str, Tensor]` — per-module **post–gate-combined** CPU float vectors
-- `gate_to_partner_path`: `dict[gate_module_path, partner_module_path]` for mirroring indices after top-$k$
-
-Load with `NeuronDetector.select_from_importance_cache(path)`. Use the **same** module lists and `gate_combines_with` as the run that produced the cache. A raw `dict[str, Tensor]` (no metadata) is still accepted, but the code logs a warning that gate modules may miss mirrored indices.
-
-### `NeuronStatistician.save_report`
-
-After `analyze`, writes:
-
-- `union_neurons.json`, `shared_neurons.json`, `non_shared_neurons.json`
-- `exclusive_<task>_neurons.json` — one per task name
-- `statistics.csv`
+- **Detection / deactivation output** uses `critical_neuron_config.json` + `neuron_indices.json`.
+- **PEFT adapter output** additionally writes `adapter_model.safetensors` (or `.pt`).
+- **Statistician output** uses the JSON-per-set + `statistics.csv` layout described above.
 
 ---
 
 ## Cookbook
 
-### Compare critical neurons across languages
+### 1. Detect → sparse PEFT → merge to a flat checkpoint
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from critnet import (
+    CriticalNeuronConfig, NeuronDetector, get_neuron_model,
+    load_neuron_indices,
+)
+
+MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+# 1) detect once
+model = AutoModelForCausalLM.from_pretrained(MODEL).cuda()
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
+result = NeuronDetector(model, config).detect(loader, sparsity_ratio=0.05)
+config.save_pretrained("./neurons", indices=result.indices)
+
+# 2) sparse PEFT training (HF Trainer)
+config = CriticalNeuronConfig.from_pretrained("./neurons")
+indices = load_neuron_indices("./neurons")
+model = AutoModelForCausalLM.from_pretrained(MODEL).cuda()
+neuron_model = get_neuron_model(model, config, indices)
+neuron_model.print_trainable_parameters()
+# ... transformers.Trainer(model=neuron_model, ...).train()
+neuron_model.save_pretrained("./adapter")
+
+# 3) reload + merge to a vanilla HF checkpoint
+from critnet import CriticalNeuronModel
+reloaded = CriticalNeuronModel.from_pretrained("./adapter")  # base path read from config
+merged = reloaded.merge_and_unload()
+merged.save_pretrained("./merged")
+AutoTokenizer.from_pretrained(MODEL).save_pretrained("./merged")
+```
+
+### 2. Freeze safety neurons during full fine-tuning
+
+```python
+import json
+from critnet import CriticalNeuronConfig, freeze_neurons
+
+model = AutoModelForCausalLM.from_pretrained(MODEL).cuda()
+with open("./safety_indices.json") as f:
+    safety_indices = json.load(f)
+
+handle = freeze_neurons(model, safety_indices, CriticalNeuronConfig())
+print(handle.summary())
+
+trainer = transformers.Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=ft_dataset,
+    callbacks=[handle.make_trainer_callback()],  # restores weights after each step
+)
+trainer.train()
+handle.remove()
+```
+
+### 3. Sweep `sparsity_ratio` without rerunning the backward pass
+
+```python
+from critnet import (
+    CriticalNeuronConfig, NeuronDetector, select_neurons_from_cache,
+)
+
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
+
+# Pay the gradient cost once; save the post-gate-combined scores.
+NeuronDetector(model, config).detect(
+    loader,
+    sparsity_ratio=0.05,  # any value; only used to log a first selection
+    save_importance_cache_path="./cache/scores.pt",
+)
+
+# Replay global top-k at any ratio, cheap.
+for r in [0.001, 0.005, 0.01, 0.05, 0.10]:
+    result = select_neurons_from_cache(
+        "./cache/scores.pt", config, sparsity_ratio=r,
+    )
+    config.save_pretrained(f"./neurons/r{r}", indices=result.indices)
+```
+
+### 4. Deactivate a neuron set and compare
+
+```python
+from critnet import (
+    CriticalNeuronConfig, NeuronDeactivator, load_neuron_indices,
+)
+
+config = CriticalNeuronConfig.from_pretrained("./neurons")
+config.base_model_name_or_path = MODEL  # override if re-targeting
+indices = load_neuron_indices("./neurons")
+
+model = AutoModelForCausalLM.from_pretrained(MODEL).cuda()
+deact = NeuronDeactivator(model, config)
+print(deact.deactivate(indices).summary())
+deact.save_pretrained("./deactivated", tokenizer=tokenizer, indices=indices)
+```
+
+### 5. Per-task statistics and reports
 
 ```python
 from critnet import CriticalNeuronConfig, NeuronStatistician
 
-task_indices = {}
-for lang in ["en", "zh", "ar", "sw"]:
-    cfg = CriticalNeuronConfig.from_pretrained(f"./detected_neurons/{lang}")
-    if cfg.neuron_indices is None:
-        raise ValueError(f"Missing neuron_indices for {lang}")
-    task_indices[lang] = cfg.neuron_indices
-
-stat_config = CriticalNeuronConfig.from_pretrained("./detected_neurons/en")
-statistician = NeuronStatistician(model=model, config=stat_config)
-result = statistician.analyze(task_indices)
-print(result.summary(task_indices))
-statistician.save_report("./neuron_analysis")
-```
-
-`result.intersection` is the cross-lingual **foundational** neuron set; `result.exclusive["zh"]` is the part of Chinese-critical neurons that is **not** shared with the other three languages.
-
-### Detect → sparse train → merge to a flat checkpoint (PEFT, base model)
-
-Sparse-PEFT demonstrations use `Qwen/Qwen3-4B-Base` — fine-tuning a *base* (non-instruct) model is the realistic setting where a sparse delta needs to learn the most.
-
-```python
-import torch
-from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
-from critnet import CriticalNeuronConfig, NeuronDetector, get_neuron_model, CriticalNeuronModel
-
-MODEL = "Qwen/Qwen3-4B-Base"
-
-# 1. Detect
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
-config = CriticalNeuronConfig(
-    sparsity_ratio=0.05,
-    norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],  # Qwen-3
-    base_model_name_or_path=MODEL,
-)
-NeuronDetector(model, config).detect(calibration_loader)
-config.save_pretrained("./neurons")
-del model
-
-# 2. Sparse PEFT
 config = CriticalNeuronConfig.from_pretrained("./neurons")
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-wrapped = get_neuron_model(model, config)
-wrapped.print_trainable_parameters()
-Trainer(
-    model=wrapped,
-    args=TrainingArguments(output_dir="./ckpts", num_train_epochs=1),
-    train_dataset=train_dataset,
-    data_collator=collator,
-).train()
-wrapped.save_pretrained("./my_adapter")
-
-# 3. Reload + merge into a vanilla HF checkpoint
-#    (base_model_name_or_path is read from ./my_adapter/critical_neuron_config.json
-#     because we set it on `config` during step 1.)
-merged = CriticalNeuronModel.from_pretrained(
-    "./my_adapter", model_kwargs={"torch_dtype": torch.bfloat16},
-)
-plain = merged.merge_and_unload()
-plain.save_pretrained("./my_merged_model")
+stats = NeuronStatistician(model=model, config=config).analyze({
+    "en": load_neuron_indices("./neurons/en"),
+    "zh": load_neuron_indices("./neurons/zh"),
+    "ar": load_neuron_indices("./neurons/ar"),
+})
+print(stats.summary())
+stats.save_report("./statistics")
 ```
 
-### Freeze safety neurons during full fine-tuning
+### 6. Custom architecture — opt in to embeddings, add `q_norm`/`k_norm`
 
 ```python
-import json
-from transformers import AutoModelForCausalLM, Trainer, TrainingArguments
-from critnet import freeze_neurons
+from critnet import CriticalNeuronConfig
 
-MODEL = "Qwen/Qwen3-4B-Instruct-2507"
-model = AutoModelForCausalLM.from_pretrained(MODEL)
-with open("./neurons/safety_indices.json") as f:
-    safety_indices = json.load(f)
-
-# `config` is optional: freeze_neurons falls back to a duck-typed norm
-# check for module paths the default config does not enumerate, so
-# Qwen-3 `q_norm` / `k_norm` entries in `safety_indices` are recognised
-# automatically.
-handle = freeze_neurons(model, safety_indices)
-handle.print_frozen_summary()
-
-trainer = Trainer(
-    model=model,
-    args=TrainingArguments(output_dir="./ft_ckpts", num_train_epochs=3, weight_decay=0.01),
-    train_dataset=train_dataset,
-    callbacks=[handle.make_trainer_callback()],   # restores frozen weights after each step
+config = CriticalNeuronConfig(
+    row_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"],
+    column_modules=["o_proj", "down_proj"],
+    norm_modules=[
+        "input_layernorm",
+        "post_attention_layernorm",
+        "q_norm", "k_norm",       # Qwen-3
+        "norm",                   # final RMSNorm
+    ],
+    embedding_modules=["embed_tokens"],   # opt in
+    gate_combines_with={"gate_proj": "up_proj"},
 )
-trainer.train()
 ```
 
-### Sweep `sparsity_ratio` without rerunning the backward pass
-
-```python
-import torch
-from transformers import AutoModelForCausalLM
-from critnet import CriticalNeuronConfig, NeuronDetector
-
-MODEL = "Qwen/Qwen3-4B-Instruct-2507"
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
-
-cfg = CriticalNeuronConfig(
-    sparsity_ratio=0.05,
-    norm_modules=["input_layernorm", "post_attention_layernorm", "q_norm", "k_norm"],
-    base_model_name_or_path=MODEL,
-)
-det = NeuronDetector(model, cfg)
-det.detect(loader, save_importance_cache_path="./cache.pt")  # expensive once
-
-for r in [0.01, 0.02, 0.05, 0.10, 0.20]:
-    cfg.sparsity_ratio = r
-    det.select_from_importance_cache("./cache.pt")           # cheap
-    cfg.save_pretrained(f"./neurons/r{r}")
-```
+To also train the embedding deltas, pass `modules_to_skip=set()` to `get_neuron_model`. Note that this may break fused-kernel pipelines (e.g. Liger): see `DEFAULT_SKIP_MODULES` in `critnet/model.py`.

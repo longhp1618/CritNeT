@@ -237,9 +237,10 @@
 
         <p>
           In CritNeT the entire pipeline is one config + one call. The config
-          describes which modules to target and the sparsity ratio; the detector
-          runs one backward pass over a <code>DataLoader</code> and writes the
-          surviving indices into <code>config.neuron_indices</code>:
+          describes <em>which modules</em> to target; the detector takes the
+          per-run <code>sparsity_ratio</code> as a keyword argument, runs one
+          backward pass over a <code>DataLoader</code>, and returns the
+          surviving indices on a plain <code>DetectionResult</code> dataclass:
         </p>
 
 <pre><code class="language-python">import torch
@@ -249,12 +250,11 @@ from critnet import CriticalNeuronConfig, NeuronDetector
 MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
 
-config = CriticalNeuronConfig(
-    sparsity_ratio=0.05,                       # keep the top 5% of pooled neurons
-    base_model_name_or_path=MODEL,
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
+result = NeuronDetector(model, config).detect(
+    calibration_loader, sparsity_ratio=0.05,   # keep the top 5% of pooled neurons
 )
-NeuronDetector(model, config).detect(calibration_loader)
-config.save_pretrained("./neurons")            # writes neuron_indices.json
+config.save_pretrained("./neurons", indices=result.indices)
 </code></pre>
 
         <p>
@@ -368,24 +368,22 @@ config.save_pretrained("./neurons")            # writes neuron_indices.json
     NeuronStatistician, NeuronDeactivator,
 )
 
-# 1. Detect utility-critical and refusal-critical sets.
-cfg_u = CriticalNeuronConfig(sparsity_ratio=0.13, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_u).detect(utility_loader)
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
 
-cfg_r = CriticalNeuronConfig(sparsity_ratio=0.06, base_model_name_or_path=MODEL)
-NeuronDetector(model, cfg_r).detect(refusal_loader)
+# 1. Detect utility-critical and refusal-critical sets.
+utility = NeuronDetector(model, config).detect(utility_loader, sparsity_ratio=0.13)
+refusal = NeuronDetector(model, config).detect(refusal_loader, sparsity_ratio=0.06)
 
 # 2. Isolate safety neurons by set difference: N_s = N_r \ N_u.
-result = NeuronStatistician(model=model, config=cfg_r).analyze({
-    "utility": cfg_u.neuron_indices,
-    "refusal": cfg_r.neuron_indices,
+stats = NeuronStatistician(model=model, config=config).analyze({
+    "utility": utility.indices,
+    "refusal": refusal.indices,
 })
-safety_indices = result.exclusive["refusal"]
-print(f"|N_s| ~ {result.param_coverage(safety_indices):.2f}% of model params")
+safety_indices = stats.exclusive["refusal"]
+print(f"|N_s| ~ {stats.param_coverage(safety_indices):.2f}% of model params")
 
 # 3. Deactivate the safety neurons in place.
-cfg_s = CriticalNeuronConfig(base_model_name_or_path=MODEL, neuron_indices=safety_indices)
-NeuronDeactivator(model, cfg_s).deactivate()
+NeuronDeactivator(model, config).deactivate(safety_indices)
 </code></pre>
 
         <p>
@@ -465,7 +463,7 @@ with open("./neurons/safety_indices.json") as f:
     safety_indices = json.load(f)
 
 handle = freeze_neurons(model, safety_indices)
-handle.print_frozen_summary()
+print(handle.summary())
 
 trainer = Trainer(
     model=model,
@@ -598,7 +596,7 @@ trainer.train()
         <p>
           <code>get_neuron_model</code> walks a HuggingFace model and replaces
           every targeted module with a <code>LinearDeltaSubspace</code> (or
-          norm / embedding variant) keyed on <code>config.neuron_indices</code>.
+          norm / embedding variant) keyed on an explicit neuron-index dict.
           It freezes all base parameters, marks only the deltas as trainable,
           and returns a <code>CriticalNeuronModel</code> that behaves like a
           normal <code>nn.Module</code> — fully compatible with
@@ -613,25 +611,23 @@ from critnet import (
 )
 
 MODEL = "Qwen/Qwen3-4B-Base"
+config = CriticalNeuronConfig(base_model_name_or_path=MODEL)
 
 # 1. Detect per-language critical neurons.
 model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda()
-lang_indices = {}
-for lang, loader in lang_loaders.items():           # en, zh, ar, sw
-    cfg = CriticalNeuronConfig(sparsity_ratio=0.05, base_model_name_or_path=MODEL)
-    NeuronDetector(model, cfg).detect(loader)
-    lang_indices[lang] = cfg.neuron_indices
+lang_indices = {
+    lang: NeuronDetector(model, config).detect(loader, sparsity_ratio=0.05).indices
+    for lang, loader in lang_loaders.items()        # en, zh, ar, sw
+}
 
 # 2. Foundational set N_all = union of per-language sets.
-result = NeuronStatistician(model=model, config=cfg).analyze(lang_indices)
-foundational = result.union
+stats = NeuronStatistician(model=model, config=config).analyze(lang_indices)
+foundational = stats.union
 
 # 3. Wrap the model so only the delta over N_all is trainable.
 del model
-cfg = CriticalNeuronConfig(sparsity_ratio=0.05, base_model_name_or_path=MODEL,
-                           neuron_indices=foundational)
 base = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-wrapped = get_neuron_model(base, cfg)
+wrapped = get_neuron_model(base, config, foundational)
 wrapped.print_trainable_parameters()
 
 # 4. Train with HF Trainer, then merge the delta into a vanilla checkpoint.

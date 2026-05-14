@@ -144,8 +144,6 @@ def run_one_job(
                 str(neurons_file),
                 "--save_path",
                 str(out_model),
-                "--ratio",
-                str(ratio),
                 "--include_all_eligible_modules",
             ],
             cwd=str(repo),

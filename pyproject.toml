@@ -14,6 +14,13 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
 [tool.setuptools.packages.find]
 include = ["critnet*", "lima_s1_exp*"]
 

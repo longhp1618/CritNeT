@@ -25,7 +25,6 @@ python lima_s1_exp/exp3_safety_neuron_deactivation/deactivation.py \
   --model_path "${BASE_MODEL}" \
   --neurons_file "${NEURONS_FILE}" \
   --save_path "${OUT_DIR}" \
-  --ratio "${RATIO}" \
   "${extra[@]}"
 
 echo "Deactivated model saved to: ${OUT_DIR}"

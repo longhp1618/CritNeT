@@ -1,19 +1,15 @@
-"""Delta-subspace wrappers, model wrapping, and checkpoint logic.
+"""Delta-subspace adapters, model wrapping, and full-FT freezing helpers.
 
-This module provides:
+This module hosts both sides of "doing something with a neuron set":
 
-* :class:`LinearDeltaSubspace` -- wraps ``nn.Linear`` to train only a
-  sparse set of neuron rows or columns while freezing the rest.
-* :class:`NormDeltaSubspace` -- wraps a normalisation layer (RMSNorm /
-  LayerNorm) to train only selected elements of the 1-D weight.
-* :class:`EmbeddingDeltaSubspace` -- wraps ``nn.Embedding`` to train
-  only selected vocabulary rows.
-* :func:`get_neuron_model` -- factory that wraps a HuggingFace model
-  into a :class:`CriticalNeuronModel`.
-* :class:`CriticalNeuronModel` -- thin wrapper providing
-  ``save_pretrained`` / ``from_pretrained`` / ``merge_and_unload``.
-* :func:`freeze_neurons` -- freeze specific neurons during full
-  fine-tuning via gradient hooks (zero forward overhead).
+* **Sparse PEFT** -- :func:`get_neuron_model` rewires a HuggingFace model so
+  that only a small dense ``dW`` parameter per targeted module is
+  trainable, and :class:`CriticalNeuronModel` wraps the result with
+  save / load / merge helpers compatible with ``transformers.Trainer``.
+* **Frozen full FT** -- :func:`freeze_neurons` registers backward hooks
+  that zero out gradients on a chosen neuron set during otherwise normal
+  fine-tuning, returning a :class:`FrozenNeuronHandle` for cleanup and
+  weight-decay-aware restoration.
 """
 
 from __future__ import annotations
@@ -26,34 +22,43 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set
 import torch
 import torch.nn as nn
 
-from .config import CriticalNeuronConfig, _CONFIG_FILENAME, _INDICES_FILENAME
+from .config import (
+    CriticalNeuronConfig,
+    _CONFIG_FILENAME,
+    _INDICES_FILENAME,
+    load_neuron_indices,
+)
 
 logger = logging.getLogger(__name__)
 
-# ======================================================================
+
+# =====================================================================
 # Delta-subspace wrappers
-# ======================================================================
+# =====================================================================
 
 
 class LinearDeltaSubspace(nn.Module):
     """Sparse adapter for ``nn.Linear``: ``y = base(x) + delta(x)``.
 
-    Only a small ``dW`` parameter covering the selected neuron indices
-    is trainable; the full base weight stays frozen.
+    Only a small ``dW`` parameter -- a slice of the weight matrix
+    indexed by *indices* -- is trainable.  The base weight (and the
+    bias, unless ``train_bias=True``) is frozen in place.
 
     Parameters
     ----------
-    base_linear : nn.Linear
-        The original linear layer (will be frozen in-place).
-    indices : sequence of int
+    base_linear
+        The original linear layer; will be frozen in place.
+    indices
         Neuron indices to make trainable.
-    mode : ``"row"`` or ``"column"``
-        * ``"row"``: each selected index is a row of W (output neuron).
+    mode
+        ``"row"`` or ``"column"``.
+
+        * ``"row"``: each index is a row of :math:`W` (output neuron),
           ``dW`` shape ``[k, in_features]``.
-        * ``"column"``: each selected index is a column of W (input neuron).
-          ``dW`` shape ``[out_features, k]``.
-    train_bias : bool
-        If ``True``, the bias (if present) remains trainable.
+        * ``"column"``: each index is a column of :math:`W` (input
+          neuron), ``dW`` shape ``[out_features, k]``.
+    train_bias
+        If ``True``, leaves the bias trainable.  Default ``False``.
     """
 
     def __init__(
@@ -64,8 +69,8 @@ class LinearDeltaSubspace(nn.Module):
         train_bias: bool = False,
     ) -> None:
         super().__init__()
-        if mode not in ("column", "row"):
-            raise ValueError(f"mode must be 'row' or 'column', got '{mode}'")
+        if mode not in ("row", "column"):
+            raise ValueError(f"mode must be 'row' or 'column', got {mode!r}.")
 
         self.base = base_linear
         self.mode = mode
@@ -85,8 +90,8 @@ class LinearDeltaSubspace(nn.Module):
                 torch.zeros(self.idx.numel(), W.size(1), device=W.device, dtype=W.dtype)
             )
 
-    # -- nn.Linear-compatible properties for code that reads module.weight --
-
+    # ``nn.Linear``-shaped surface so external code that reads
+    # ``module.weight`` / ``module.bias`` still works.
     @property
     def weight(self) -> torch.Tensor:
         return self.base.weight
@@ -107,12 +112,11 @@ class LinearDeltaSubspace(nn.Module):
         y = self.base(x)
         if self.mode == "column":
             return y + (x[..., self.idx] @ self.dW.t())
-        upd = x @ self.dW.t()
-        return y.index_add(-1, self.idx, upd)
+        return y.index_add(-1, self.idx, x @ self.dW.t())
 
     @torch.no_grad()
     def merge_to_linear_(self) -> nn.Linear:
-        """Merge ``dW`` into the base weight in-place and return the ``nn.Linear``."""
+        """Merge ``dW`` into the base weight in place and return the ``nn.Linear``."""
         W = self.base.weight
         if self.mode == "column":
             W[:, self.idx] += self.dW
@@ -124,15 +128,15 @@ class LinearDeltaSubspace(nn.Module):
 class NormDeltaSubspace(nn.Module):
     """Sparse adapter for normalisation layers with a 1-D weight.
 
-    Only selected elements of the weight vector are trainable.
+    Only selected positions of the weight vector are trainable.
 
     Parameters
     ----------
-    base_norm : nn.Module
-        The original norm layer (e.g. ``RMSNorm``, ``LayerNorm``).
-        Must have a ``.weight`` attribute of shape ``[dim]``.
-    indices : sequence of int
-        Elements of the weight to make trainable.
+    base_norm
+        Any module with a 1-D ``.weight`` attribute (``RMSNorm`` /
+        ``LayerNorm`` / etc.).  Frozen in place.
+    indices
+        Positions of the weight vector to make trainable.
     """
 
     def __init__(self, base_norm: nn.Module, indices: Sequence[int]) -> None:
@@ -141,11 +145,15 @@ class NormDeltaSubspace(nn.Module):
         self.register_buffer("idx", torch.tensor(sorted(indices), dtype=torch.long))
 
         self.base.weight.requires_grad_(False)
-        if hasattr(self.base, "bias") and self.base.bias is not None:
+        if getattr(self.base, "bias", None) is not None:
             self.base.bias.requires_grad_(False)
 
         self.dW = nn.Parameter(
-            torch.zeros(self.idx.numel(), device=self.base.weight.device, dtype=self.base.weight.dtype)
+            torch.zeros(
+                self.idx.numel(),
+                device=self.base.weight.device,
+                dtype=self.base.weight.dtype,
+            )
         )
         self.register_buffer(
             "_inv_base_w",
@@ -155,70 +163,73 @@ class NormDeltaSubspace(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
         scale = self.dW * self._inv_base_w
-        correction = out[..., self.idx] * scale
-        return out.index_add(-1, self.idx, correction)
+        return out.index_add(-1, self.idx, out[..., self.idx] * scale)
 
     @torch.no_grad()
     def merge_to_norm_(self) -> nn.Module:
-        """Merge ``dW`` into the base weight in-place and return the base module."""
+        """Merge ``dW`` into the base weight in place and return the base module."""
         self.base.weight[self.idx] += self.dW
         return self.base
 
 
 class EmbeddingDeltaSubspace(nn.Module):
-    """Sparse adapter for ``nn.Embedding``: only selected vocabulary rows are trainable.
+    """Sparse adapter for ``nn.Embedding``: only selected rows are trainable.
 
     Parameters
     ----------
-    base_embedding : nn.Embedding
-        The original embedding layer (frozen in-place).
-    indices : sequence of int
-        Row indices (vocabulary entries) to make trainable.
+    base_embedding
+        The original embedding layer (frozen in place).
+    indices
+        Vocabulary row indices to make trainable.
     """
 
     def __init__(self, base_embedding: nn.Embedding, indices: Sequence[int]) -> None:
         super().__init__()
         self.base = base_embedding
         self.register_buffer("idx", torch.tensor(sorted(indices), dtype=torch.long))
-
         self.base.weight.requires_grad_(False)
 
         self.dW = nn.Parameter(
-            torch.zeros(self.idx.numel(), self.base.embedding_dim, device=self.base.weight.device, dtype=self.base.weight.dtype)
+            torch.zeros(
+                self.idx.numel(),
+                self.base.embedding_dim,
+                device=self.base.weight.device,
+                dtype=self.base.weight.dtype,
+            )
         )
-        self._idx_to_local = {int(v): i for i, v in enumerate(self.idx.tolist())}
 
-        _lookup = torch.zeros(base_embedding.num_embeddings, dtype=torch.long)
-        for g, l in self._idx_to_local.items():
-            _lookup[g] = l
-        self.register_buffer("_lookup", _lookup)
+        # Build O(1) lookup tables for the forward path.
+        lookup = torch.zeros(base_embedding.num_embeddings, dtype=torch.long)
+        for local, global_idx in enumerate(self.idx.tolist()):
+            lookup[global_idx] = local
+        self.register_buffer("_lookup", lookup)
 
-        _hit_mask = torch.zeros(base_embedding.num_embeddings, dtype=torch.bool)
-        _hit_mask[self.idx] = True
-        self.register_buffer("_hit_mask", _hit_mask)
+        hit_mask = torch.zeros(base_embedding.num_embeddings, dtype=torch.bool)
+        hit_mask[self.idx] = True
+        self.register_buffer("_hit_mask", hit_mask)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         out = self.base(input_ids)
         hit = self._hit_mask[input_ids]
         if hit.any():
             local = self._lookup[input_ids]
-            delta = self.dW[local]
-            out = out + delta * hit.unsqueeze(-1).to(out.dtype)
+            out = out + self.dW[local] * hit.unsqueeze(-1).to(out.dtype)
         return out
 
     @torch.no_grad()
     def merge_to_embedding_(self) -> nn.Embedding:
-        """Merge ``dW`` into the base weight in-place and return the base module."""
+        """Merge ``dW`` into the base weight in place and return the base module."""
         self.base.weight[self.idx] += self.dW
         return self.base
 
 
-# Helper type for delta wrappers
+# Tuple used for ``isinstance`` checks across this module.
 _DeltaModule = (LinearDeltaSubspace, NormDeltaSubspace, EmbeddingDeltaSubspace)
 
-# ======================================================================
+
+# =====================================================================
 # Module replacement helpers
-# ======================================================================
+# =====================================================================
 
 
 def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
@@ -232,9 +243,9 @@ def _set_submodule(model: nn.Module, name: str, new_module: nn.Module) -> None:
 
 
 def _is_norm(module: nn.Module) -> bool:
-    """Heuristic: module is a normalisation layer with a 1-D weight."""
+    """Heuristic: *module* is a normalisation layer with a 1-D weight."""
     cls_name = type(module).__name__.lower()
-    has_weight = hasattr(module, "weight") and module.weight is not None
+    has_weight = getattr(module, "weight", None) is not None
     if not has_weight:
         return False
     is_1d = module.weight.dim() == 1
@@ -242,125 +253,133 @@ def _is_norm(module: nn.Module) -> bool:
     return is_1d and looks_like_norm
 
 
-# ======================================================================
+# =====================================================================
 # get_neuron_model
-# ======================================================================
+# =====================================================================
 
 
 DEFAULT_SKIP_MODULES: FrozenSet[str] = frozenset({"lm_head", "embed_tokens"})
 """Module leaf-names that are skipped during delta-wrapping by default.
 
 ``lm_head`` is excluded because fused-kernel libraries (e.g. Liger)
-replace the model's forward to access ``lm_head.weight`` directly,
-bypassing the wrapper's ``forward()`` and breaking autograd for the
-``dW`` delta.  ``embed_tokens`` is excluded for the same reason
-(weight-tying with ``lm_head`` and incompatibility with fused kernels).
-
-Users who explicitly need to wrap these can pass
-``modules_to_skip=set()`` to :func:`get_neuron_model`.
+replace the model's forward to read ``lm_head.weight`` directly, which
+bypasses any wrapper and breaks autograd through ``dW``.
+``embed_tokens`` is excluded for the same reason (weight-tying with
+``lm_head`` + fused-kernel incompatibility).  Pass
+``modules_to_skip=set()`` to override.
 """
 
 
 def get_neuron_model(
     model: nn.Module,
     config: CriticalNeuronConfig,
+    indices: Dict[str, List[int]],
+    *,
     modules_to_skip: Optional[Set[str]] = None,
 ) -> "CriticalNeuronModel":
-    """Wrap a HuggingFace model for critical-neuron fine-tuning.
+    """Wrap *model* for critical-neuron sparse PEFT.
 
-    1. Iterates all named modules and replaces each target module with its
-       delta-subspace wrapper.
-    2. Freezes all parameters, then unfreezes only the ``dW`` parameters.
-    3. Calls ``enable_input_require_grads`` for gradient flow.
+    The function:
+
+    1. Replaces every targeted module that appears in *indices* with a
+       delta-subspace wrapper of the appropriate type
+       (:class:`LinearDeltaSubspace` / :class:`NormDeltaSubspace` /
+       :class:`EmbeddingDeltaSubspace`).
+    2. Freezes every base parameter; unfreezes only the ``dW`` of each
+       wrapper.
+    3. Calls ``enable_input_require_grads`` if the model exposes it
+       (so gradient checkpointing keeps working).
 
     Parameters
     ----------
-    model : nn.Module
-        A pretrained ``transformers`` model (e.g. from
-        ``AutoModelForCausalLM.from_pretrained``).
-    config : CriticalNeuronConfig
-        Must have ``neuron_indices`` populated (not ``None``).
-    modules_to_skip : set of str, optional
-        Module leaf-names (e.g. ``{"lm_head"}``) to exclude from
-        delta-wrapping.  These modules stay as plain ``nn.Linear``
-        with frozen weights.  Defaults to :data:`DEFAULT_SKIP_MODULES`.
-        Pass an empty set to wrap everything.
+    model
+        A pretrained ``transformers`` model.  Mutated in place.
+    config
+        Provides ``classify(...)`` and the skip / target sets.
+    indices
+        ``module_path -> [neuron_idx, ...]`` -- the modules to wrap.
+    modules_to_skip
+        Module leaf-names to exclude.  Defaults to
+        :data:`DEFAULT_SKIP_MODULES` (``{"lm_head", "embed_tokens"}``).
 
     Returns
     -------
     CriticalNeuronModel
     """
+    if not indices:
+        raise ValueError(
+            "indices is empty: nothing to wrap. "
+            "Run NeuronDetector.detect(...) and pass `result.indices`, "
+            "or load with critnet.load_neuron_indices(...)."
+        )
     if modules_to_skip is None:
         modules_to_skip = DEFAULT_SKIP_MODULES
 
-    if config.neuron_indices is None:
+    named = dict(model.named_modules())
+    missing = [k for k in indices if k not in named]
+    if missing:
         raise ValueError(
-            "config.neuron_indices is None. Run NeuronDetector.detect() "
-            "or load indices via CriticalNeuronConfig.from_pretrained() first."
+            f"{len(missing)} module path(s) not found in model: "
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''}."
         )
 
-    modules_to_wrap: List[tuple] = []
+    to_wrap: List[tuple] = []
     skipped: List[str] = []
-    for name, module in model.named_modules():
-        if not config.matches_target(name):
+    for name, idx_list in indices.items():
+        if not idx_list:
             continue
         leaf = name.rsplit(".", 1)[-1]
         if leaf in modules_to_skip:
             skipped.append(name)
             continue
-        if name not in config.neuron_indices:
-            continue
-        indices = config.neuron_indices[name]
-        if len(indices) == 0:
-            continue
-        modules_to_wrap.append((name, module, indices))
+        mod_type = config.classify(name)
+        if mod_type is None:
+            raise ValueError(
+                f"Module '{name}' appears in indices but is not classified by the "
+                f"config (leaf {leaf!r}). Add it to row_modules / column_modules / "
+                f"norm_modules / embedding_modules on the config."
+            )
+        to_wrap.append((name, named[name], mod_type, idx_list))
 
     if skipped:
         logger.warning(
-            "Skipped delta-wrapping for %d module(s) (incompatible with "
-            "fused kernels): %s. Pass modules_to_skip=set() to override.",
-            len(skipped),
-            skipped[:5],
+            "Skipped delta-wrapping for %d module(s) incompatible with fused "
+            "kernels: %s. Pass modules_to_skip=set() to override.",
+            len(skipped), skipped[:5],
         )
 
-    for name, module, indices in modules_to_wrap:
-        mod_type = config.get_module_type(name)
-
+    for name, module, mod_type, idx_list in to_wrap:
         if mod_type in ("row", "column"):
             if not isinstance(module, nn.Linear):
                 raise TypeError(
-                    f"Module '{name}' is categorised as '{mod_type}' "
-                    f"but is {type(module).__name__}, not nn.Linear."
+                    f"Module {name!r} is categorised as {mod_type!r} but is "
+                    f"{type(module).__name__}, not nn.Linear."
                 )
-            wrapper = LinearDeltaSubspace(module, indices, mode=mod_type)
-
+            wrapper: nn.Module = LinearDeltaSubspace(module, idx_list, mode=mod_type)
         elif mod_type == "norm":
             if not _is_norm(module):
                 raise TypeError(
-                    f"Module '{name}' is categorised as 'norm' but "
-                    f"does not look like a normalisation layer "
-                    f"({type(module).__name__})."
+                    f"Module {name!r} is categorised as 'norm' but does not "
+                    f"look like a 1-D norm layer ({type(module).__name__})."
                 )
-            wrapper = NormDeltaSubspace(module, indices)
-
+            wrapper = NormDeltaSubspace(module, idx_list)
         elif mod_type == "embedding":
             if not isinstance(module, nn.Embedding):
                 raise TypeError(
-                    f"Module '{name}' is categorised as 'embedding' "
-                    f"but is {type(module).__name__}, not nn.Embedding."
+                    f"Module {name!r} is categorised as 'embedding' but is "
+                    f"{type(module).__name__}, not nn.Embedding."
                 )
-            wrapper = EmbeddingDeltaSubspace(module, indices)
-        else:
-            raise ValueError(f"Unknown module type '{mod_type}' for '{name}'")
+            wrapper = EmbeddingDeltaSubspace(module, idx_list)
+        else:  # pragma: no cover -- classify() never returns anything else
+            raise ValueError(f"Unsupported module type {mod_type!r} for {name!r}.")
 
         _set_submodule(model, name, wrapper)
 
-    # Freeze everything, then unfreeze only delta params
     for p in model.parameters():
         p.requires_grad_(False)
-    for _, module in model.named_modules():
-        if isinstance(module, _DeltaModule):
-            module.dW.requires_grad_(True)
+    for _, m in model.named_modules():
+        if isinstance(m, _DeltaModule):
+            m.dW.requires_grad_(True)
 
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -371,25 +390,227 @@ def get_neuron_model(
     n_total = sum(p.numel() for p in model.parameters())
     logger.info(
         "CriticalNeuronModel: %d / %d params trainable (%.4f%%)",
-        n_trainable, n_total, 100.0 * n_trainable / n_total if n_total else 0,
+        n_trainable, n_total, 100.0 * n_trainable / n_total if n_total else 0.0,
     )
-
     return wrapped
 
 
-# ======================================================================
+# =====================================================================
+# CriticalNeuronModel
+# =====================================================================
+
+
+class CriticalNeuronModel(nn.Module):
+    """Thin wrapper around a ``transformers`` model for critical-neuron PEFT.
+
+    Forward, ``generate``, and attribute access are delegated to the inner
+    model.  This object adds:
+
+    * :attr:`neuron_indices` -- live view of the wrapped indices.
+    * :meth:`save_pretrained` / :meth:`from_pretrained` -- adapter-only
+      checkpoint I/O.
+    * :meth:`merge_and_unload` -- in-place delta merge, returning a
+      plain ``nn.Module``.
+
+    ``self.peft_config`` is exposed as a HuggingFace-Trainer compatibility
+    alias for :attr:`config`; do not rely on it elsewhere.
+    """
+
+    _ADAPTER_FILENAME = "adapter_model.safetensors"
+    _ADAPTER_FILENAME_PT = "adapter_model.pt"
+
+    def __init__(self, model: nn.Module, config: CriticalNeuronConfig) -> None:
+        super().__init__()
+        self.model = model
+        self.config = config
+
+    # HF Trainer treats objects with `peft_config` as PEFT models -- alias it.
+    @property
+    def peft_config(self) -> CriticalNeuronConfig:
+        return self.config
+
+    # ------------------------------------------------------------------
+    # Forward delegation
+    # ------------------------------------------------------------------
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model(*args, **kwargs)
+
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model.generate(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+    # ------------------------------------------------------------------
+    # Live state
+    # ------------------------------------------------------------------
+
+    @property
+    def neuron_indices(self) -> Dict[str, List[int]]:
+        """Live ``module_path -> [neuron_idx, ...]`` view of the wrapped indices."""
+        out: Dict[str, List[int]] = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, _DeltaModule):
+                out[name] = module.idx.tolist()
+        return out
+
+    def get_adapter_state_dict(self) -> "OrderedDict[str, torch.Tensor]":
+        """Collect all ``dW`` and ``idx`` tensors from every delta wrapper."""
+        out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        for name, module in self.model.named_modules():
+            if isinstance(module, _DeltaModule):
+                out[f"{name}.dW"] = module.dW.detach().cpu()
+                out[f"{name}.idx"] = module.idx.cpu()
+        return out
+
+    def print_trainable_parameters(self) -> None:
+        """Print trainable / total parameter counts (PEFT-compatible API)."""
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.model.parameters())
+        pct = 100.0 * n_trainable / n_total if n_total else 0.0
+        print(
+            f"trainable params: {n_trainable:,} || "
+            f"all params: {n_total:,} || "
+            f"trainable%: {pct:.4f}%"
+        )
+
+    # ------------------------------------------------------------------
+    # Save / load
+    # ------------------------------------------------------------------
+
+    def save_pretrained(self, save_directory: str, **kwargs: Any) -> None:
+        """Save adapter weights, config, and indices.
+
+        Files written to *save_directory*:
+
+        * ``adapter_model.safetensors`` (or ``adapter_model.pt`` when
+          ``safetensors`` is unavailable) -- ``dW`` + ``idx`` per module.
+        * ``critical_neuron_config.json`` -- the config.
+        * ``neuron_indices.json`` -- the live neuron index map.
+
+        Extra kwargs are accepted (for compatibility with HF Trainer's
+        ``save_pretrained`` call site) and ignored.
+        """
+        del kwargs
+        os.makedirs(save_directory, exist_ok=True)
+
+        state = self.get_adapter_state_dict()
+        try:
+            from safetensors.torch import save_file
+            save_file(state, os.path.join(save_directory, self._ADAPTER_FILENAME))
+        except ImportError:
+            logger.warning("safetensors not installed; falling back to torch.save (.pt).")
+            torch.save(state, os.path.join(save_directory, self._ADAPTER_FILENAME_PT))
+
+        self.config.save_pretrained(save_directory, indices=self.neuron_indices)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        adapter_path: str,
+        *,
+        base_model_name_or_path: Optional[str] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        modules_to_skip: Optional[Set[str]] = None,
+    ) -> "CriticalNeuronModel":
+        """Load a base model and inject saved adapter weights.
+
+        Parameters
+        ----------
+        adapter_path
+            Directory containing the adapter files
+            (``adapter_model.*``, ``critical_neuron_config.json``,
+            ``neuron_indices.json``).
+        base_model_name_or_path
+            HuggingFace id or local path of the *base* model.  When
+            ``None``, falls back to the value recorded in
+            ``adapter_path/critical_neuron_config.json``.
+        model_kwargs
+            Extra kwargs forwarded to ``AutoModelForCausalLM.from_pretrained``.
+        modules_to_skip
+            Forwarded to :func:`get_neuron_model`.
+        """
+        from transformers import AutoModelForCausalLM
+
+        config = CriticalNeuronConfig.from_pretrained(adapter_path)
+        indices = load_neuron_indices(adapter_path)
+
+        if base_model_name_or_path is None:
+            base_model_name_or_path = config.base_model_name_or_path
+        if not base_model_name_or_path:
+            raise ValueError(
+                "base_model_name_or_path was not provided and is not recorded in "
+                f"{os.path.join(adapter_path, _CONFIG_FILENAME)}. Pass it explicitly."
+            )
+        config.base_model_name_or_path = base_model_name_or_path
+
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name_or_path, **(model_kwargs or {})
+        )
+        wrapped = get_neuron_model(
+            model, config, indices, modules_to_skip=modules_to_skip
+        )
+
+        sf_path = os.path.join(adapter_path, cls._ADAPTER_FILENAME)
+        pt_path = os.path.join(adapter_path, cls._ADAPTER_FILENAME_PT)
+        if os.path.isfile(sf_path):
+            from safetensors.torch import load_file
+            state = load_file(sf_path)
+        elif os.path.isfile(pt_path):
+            state = torch.load(pt_path, map_location="cpu")
+        else:
+            logger.warning(
+                "No adapter weights at %s or %s; wrappers retain zero dW.",
+                sf_path, pt_path,
+            )
+            return wrapped
+
+        for name, module in wrapped.model.named_modules():
+            dw_key = f"{name}.dW"
+            if isinstance(module, _DeltaModule) and dw_key in state:
+                module.dW.data.copy_(state[dw_key])
+
+        return wrapped
+
+    # ------------------------------------------------------------------
+    # Merge
+    # ------------------------------------------------------------------
+
+    def merge_and_unload(self) -> nn.Module:
+        """Merge every delta into the base weights and return the plain model.
+
+        After this call the wrapper is no longer needed; the returned
+        model is a vanilla ``transformers`` model with the neuron
+        updates baked into the weights.
+        """
+        for name, module in list(self.model.named_modules()):
+            if isinstance(module, LinearDeltaSubspace):
+                _set_submodule(self.model, name, module.merge_to_linear_())
+            elif isinstance(module, NormDeltaSubspace):
+                _set_submodule(self.model, name, module.merge_to_norm_())
+            elif isinstance(module, EmbeddingDeltaSubspace):
+                _set_submodule(self.model, name, module.merge_to_embedding_())
+        return self.model
+
+
+# =====================================================================
 # freeze_neurons  (safety-preserving full fine-tuning)
-# ======================================================================
+# =====================================================================
 
 
 class FrozenNeuronHandle:
-    """Handle returned by :func:`freeze_neurons`.
+    """Resource handle returned by :func:`freeze_neurons`.
 
-    Gradient hooks zero out frozen-neuron gradients during backward,
-    preventing the optimizer from updating them.  When the optimizer
-    uses weight decay (``weight_decay > 0``), call
-    :meth:`restore_frozen_weights` after each optimizer step to undo
-    the decay on frozen neurons.
+    The forward pass of the wrapped model is unchanged: only backward
+    hooks are inserted, which zero out the gradient slices of the
+    frozen neurons each step.  When the optimiser uses weight decay,
+    call :meth:`restore_frozen_weights` after every optimiser step to
+    counteract decay drift -- or pass :meth:`make_trainer_callback` to
+    the HF ``Trainer`` to do it for you.
     """
 
     def __init__(
@@ -406,11 +627,11 @@ class FrozenNeuronHandle:
 
     @torch.no_grad()
     def restore_frozen_weights(self) -> None:
-        """Restore frozen neurons to their original pre-training values.
+        """Restore the frozen weight slices to their pre-training values.
 
-        Call after each optimizer step to counteract weight-decay drift.
-        If ``weight_decay == 0``, this is unnecessary (gradient hooks
-        already prevent all updates).
+        Call after every optimiser step when ``weight_decay > 0``.
+        Unnecessary when ``weight_decay == 0`` (gradient hooks already
+        block every update).
         """
         for weight, mode, idx, saved in self._frozen:
             dev = weight.device
@@ -422,36 +643,33 @@ class FrozenNeuronHandle:
                 weight.data[idx_d] = saved_d
 
     def remove(self) -> None:
-        """Remove all gradient hooks (unfreezes the neurons)."""
+        """Detach every gradient hook (effectively unfreezes the neurons)."""
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
         self._frozen.clear()
 
     def make_trainer_callback(self) -> Any:
-        """Return a HuggingFace ``TrainerCallback`` that restores frozen
-        weights after each optimizer step.
+        """Return a ``transformers.TrainerCallback`` for HF Trainer.
 
-        Usage::
-
-            frozen = freeze_neurons(model, indices, config)
-            trainer = Trainer(..., callbacks=[frozen.make_trainer_callback()])
+        The callback invokes :meth:`restore_frozen_weights` at the end of
+        every optimiser step.
         """
         from transformers import TrainerCallback
 
         handle = self
 
         class _FreezeCallback(TrainerCallback):
-            def on_step_end(self, args, state, control, **kwargs):
+            def on_step_end(self, args, state, control, **kwargs):  # noqa: D401
                 handle.restore_frozen_weights()
 
         return _FreezeCallback()
 
-    def print_frozen_summary(self) -> None:
-        """Print summary of frozen vs total parameters."""
-        pct = 100.0 * self.n_frozen / self.n_total if self.n_total else 0
+    def summary(self) -> str:
+        """One-line summary of frozen vs trainable parameter counts."""
+        pct = 100.0 * self.n_frozen / self.n_total if self.n_total else 0.0
         n_trainable = self.n_total - self.n_frozen
-        print(
+        return (
             f"frozen params: {self.n_frozen:,} || "
             f"trainable params: {n_trainable:,} || "
             f"all params: {self.n_total:,} || "
@@ -461,302 +679,108 @@ class FrozenNeuronHandle:
 
 def freeze_neurons(
     model: nn.Module,
-    neuron_indices: Dict[str, List[int]],
+    indices: Dict[str, List[int]],
     config: Optional[CriticalNeuronConfig] = None,
 ) -> FrozenNeuronHandle:
-    """Freeze specific neurons during full fine-tuning.
+    """Freeze the chosen neurons during full fine-tuning.
 
-    Registers backward hooks that zero out gradients for the specified
-    neurons.  The model structure is **unchanged** -- no wrappers are
-    inserted, so the forward pass is identical to the base model (zero
-    overhead).
+    The model is left structurally unchanged -- only backward hooks are
+    registered, so the forward pass has **zero overhead**.  Each hook
+    zeroes the gradient slice corresponding to one frozen neuron.
 
-    Use case: train the full model while *preserving* safety-critical
-    (or otherwise important) neurons.
+    Strictness
+    ----------
+    The classifier path is:
+
+    1. If ``config.classify(name)`` returns a known type, use it.
+    2. Otherwise, if the module is structurally a 1-D norm
+       (:func:`_is_norm`), treat it as ``"norm"`` -- this is safe
+       because norms have no axis ambiguity.
+    3. Otherwise, raise ``ValueError``.  Wrong-axis fallbacks are not
+       attempted: silently freezing the wrong axis of an ``nn.Linear``
+       would be undetectable from the outside.
 
     Parameters
     ----------
-    model : nn.Module
-        A pretrained model (all parameters should have
-        ``requires_grad=True``).
-    neuron_indices : dict[str, list[int]]
-        Mapping from fully-qualified module path (e.g.
-        ``"model.layers.0.self_attn.q_proj"``) to the neuron indices
-        to **freeze**.
-    config : CriticalNeuronConfig, optional
-        Used to determine module types (row / column / norm).
-        A default config is created if not provided.
+    model
+        A trainable model.  ``requires_grad`` is not changed here.
+    indices
+        ``module_path -> [neuron_idx, ...]`` to freeze.
+    config
+        Used for classification.  A default config is constructed when
+        ``None``.
 
     Returns
     -------
     FrozenNeuronHandle
-        Call ``handle.restore_frozen_weights()`` after each optimizer
-        step when ``weight_decay > 0``, or pass
-        ``handle.make_trainer_callback()`` to the HF Trainer.
     """
     if config is None:
         config = CriticalNeuronConfig()
+
+    named = dict(model.named_modules())
+    plan: List[tuple] = []
+    bad: List[str] = []
+    for name, idx_list in indices.items():
+        module = named.get(name)
+        if module is None or not idx_list:
+            continue
+        mod_type = config.classify(name)
+        if mod_type is None:
+            if _is_norm(module):
+                mod_type = "norm"
+            else:
+                bad.append(name)
+                continue
+        plan.append((name, module, mod_type, idx_list))
+    if bad:
+        raise ValueError(
+            f"Cannot classify {len(bad)} module(s) for freezing: "
+            f"{bad[:5]}{'...' if len(bad) > 5 else ''}. Either add the leaf "
+            "names to the appropriate category on the config or remove them "
+            "from the indices dict."
+        )
 
     hooks: List[torch.utils.hooks.RemovableHandle] = []
     frozen_snapshots: List[tuple] = []
     n_frozen = 0
 
-    def _infer_module_type(name: str, module: nn.Module) -> Optional[str]:
-        """Try config first; fall back to heuristic for modules not in config targets."""
-        if config.matches_target(name):
-            return config.get_module_type(name)
-        if _is_norm(module):
-            return "norm"
-        if isinstance(module, nn.Linear):
-            leaf = name.rsplit(".", 1)[-1]
-            if leaf in (config.column_modules or []):
-                return "column"
-            return "row"
-        return None
+    for name, module, mod_type, idx_list in plan:
+        idx = torch.tensor(sorted(idx_list), dtype=torch.long)
 
-    for name, module in model.named_modules():
-        if name not in neuron_indices:
-            continue
-        indices = neuron_indices[name]
-        if not indices:
-            continue
-
-        mod_type = _infer_module_type(name, module)
-        if mod_type is None:
-            logger.warning(
-                "freeze_neurons: '%s' (%s) not recognised; skipping.",
-                name, type(module).__name__,
+        if mod_type in ("row", "column") and isinstance(module, nn.Linear):
+            axis = 0 if mod_type == "row" else 1
+            saved = (
+                module.weight.data[idx].clone()
+                if axis == 0
+                else module.weight.data[:, idx].clone()
             )
-            continue
-
-        idx = torch.tensor(sorted(indices), dtype=torch.long)
-
-        if isinstance(module, nn.Linear):
-            if mod_type == "row":
-                saved = module.weight.data[idx].clone()
-                hook = module.weight.register_hook(
-                    lambda g, i=idx: g.index_fill_(0, i.to(g.device), 0)
-                )
-                frozen_snapshots.append((module.weight, "row", idx, saved))
-                n_frozen += len(indices) * module.weight.size(1)
-            elif mod_type == "column":
-                saved = module.weight.data[:, idx].clone()
-                hook = module.weight.register_hook(
-                    lambda g, i=idx: g.index_fill_(1, i.to(g.device), 0)
-                )
-                frozen_snapshots.append((module.weight, "column", idx, saved))
-                n_frozen += module.weight.size(0) * len(indices)
-            else:
-                continue
+            hook = module.weight.register_hook(
+                lambda g, _i=idx, _a=axis: g.index_fill_(_a, _i.to(g.device), 0)
+            )
+            frozen_snapshots.append((module.weight, mod_type, idx, saved))
             hooks.append(hook)
+            scalar_per_neuron = module.weight.size(1 - axis)
+            n_frozen += len(idx_list) * scalar_per_neuron
 
-        elif _is_norm(module):
+        elif mod_type == "norm" and _is_norm(module):
             saved = module.weight.data[idx].clone()
             hook = module.weight.register_hook(
-                lambda g, i=idx: g.index_fill_(0, i.to(g.device), 0)
+                lambda g, _i=idx: g.index_fill_(0, _i.to(g.device), 0)
             )
             frozen_snapshots.append((module.weight, "norm", idx, saved))
             hooks.append(hook)
-            n_frozen += len(indices)
+            n_frozen += len(idx_list)
+
+        else:
+            # Should be unreachable due to strict classification above.
+            logger.warning(
+                "Skipping module %s (%s, %s): no freeze rule.",
+                name, mod_type, type(module).__name__,
+            )
 
     n_total = sum(p.numel() for p in model.parameters())
     logger.info(
-        "freeze_neurons: %d frozen weight elements out of %d total (%.4f%%)",
-        n_frozen,
-        n_total,
-        100.0 * n_frozen / n_total if n_total else 0,
+        "freeze_neurons: %d frozen scalar weights out of %d total (%.4f%%)",
+        n_frozen, n_total, 100.0 * n_frozen / n_total if n_total else 0.0,
     )
-
     return FrozenNeuronHandle(hooks, frozen_snapshots, n_frozen, n_total)
-
-
-# ======================================================================
-# CriticalNeuronModel
-# ======================================================================
-
-
-class CriticalNeuronModel(nn.Module):
-    """Thin wrapper around a ``transformers`` model for critical-neuron PEFT.
-
-    Delegates ``forward`` and most attribute access to the inner model
-    while adding ``save_pretrained``, ``from_pretrained``, and
-    ``merge_and_unload``.
-    """
-
-    _ADAPTER_FILENAME = "adapter_model.safetensors"
-    _ADAPTER_FILENAME_PT = "adapter_model.pt"
-
-    def __init__(self, model: nn.Module, config: CriticalNeuronConfig) -> None:
-        super().__init__()
-        self.model = model
-        self.peft_config = config
-
-    # ------------------------------------------------------------------
-    # Forward delegation
-    # ------------------------------------------------------------------
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self.model(*args, **kwargs)
-
-    def generate(self, *args: Any, **kwargs: Any) -> Any:
-        return self.model.generate(*args, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Attribute proxy (Trainer compatibility)
-    # ------------------------------------------------------------------
-
-    def __getattr__(self, name: str) -> Any:
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
-
-    # ------------------------------------------------------------------
-    # State dict helpers
-    # ------------------------------------------------------------------
-
-    def get_adapter_state_dict(self) -> OrderedDict:
-        """Collect all ``dW`` (and ``idx``) tensors from delta wrappers."""
-        out = OrderedDict()
-        for name, module in self.model.named_modules():
-            if isinstance(module, _DeltaModule):
-                out[f"{name}.dW"] = module.dW.detach().cpu()
-                out[f"{name}.idx"] = module.idx.cpu()
-        return out
-
-    # ------------------------------------------------------------------
-    # Save / Load
-    # ------------------------------------------------------------------
-
-    def save_pretrained(self, save_directory: str, **kwargs: Any) -> None:
-        """Save the adapter weights and config.
-
-        Only the sparse ``dW`` parameters are saved -- **not** the full
-        base-model weights.
-
-        Files written to *save_directory*:
-
-        * ``adapter_model.safetensors`` -- delta weights.
-        * ``critical_neuron_config.json`` -- config.
-        * ``neuron_indices.json`` -- neuron index mapping.
-        """
-        os.makedirs(save_directory, exist_ok=True)
-
-        state = self.get_adapter_state_dict()
-
-        try:
-            from safetensors.torch import save_file
-            save_file(state, os.path.join(save_directory, self._ADAPTER_FILENAME))
-        except ImportError:
-            logger.warning(
-                "safetensors not installed; falling back to torch.save (.pt)."
-            )
-            torch.save(state, os.path.join(save_directory, self._ADAPTER_FILENAME_PT))
-
-        self.peft_config.save_pretrained(save_directory)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        adapter_path: str,
-        base_model_name_or_path: Optional[str] = None,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        modules_to_skip: Optional[Set[str]] = None,
-    ) -> "CriticalNeuronModel":
-        """Load a base model and inject saved adapter weights.
-
-        Parameters
-        ----------
-        adapter_path : str
-            Directory containing the adapter files (``adapter_model.*``,
-            ``critical_neuron_config.json``, ``neuron_indices.json``).
-        base_model_name_or_path : str, optional
-            HuggingFace model id or local path.  If ``None``, falls back
-            to the ``base_model_name_or_path`` recorded inside
-            ``adapter_path/critical_neuron_config.json``.
-        model_kwargs : dict, optional
-            Extra keyword arguments forwarded to
-            ``AutoModelForCausalLM.from_pretrained`` (e.g.
-            ``torch_dtype``, ``device_map``).
-        modules_to_skip : set of str, optional
-            Forwarded to :func:`get_neuron_model`.
-
-        Returns
-        -------
-        CriticalNeuronModel
-        """
-        from transformers import AutoModelForCausalLM
-
-        config = CriticalNeuronConfig.from_pretrained(adapter_path)
-        if base_model_name_or_path is None:
-            base_model_name_or_path = config.base_model_name_or_path
-        if not base_model_name_or_path:
-            raise ValueError(
-                "base_model_name_or_path was not provided and is not recorded in "
-                f"{adapter_path}/critical_neuron_config.json. Pass it explicitly."
-            )
-        config.base_model_name_or_path = base_model_name_or_path
-
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_name_or_path, **(model_kwargs or {})
-        )
-        wrapped = get_neuron_model(model, config, modules_to_skip=modules_to_skip)
-
-        # Load adapter state dict
-        sf_path = os.path.join(adapter_path, cls._ADAPTER_FILENAME)
-        pt_path = os.path.join(adapter_path, cls._ADAPTER_FILENAME_PT)
-        if os.path.isfile(sf_path):
-            from safetensors.torch import load_file
-            state = load_file(sf_path)
-        elif os.path.isfile(pt_path):
-            state = torch.load(pt_path, map_location="cpu")
-        else:
-            logger.warning("No adapter weights found in %s; wrappers have zero dW.", adapter_path)
-            return wrapped
-
-        # Inject dW values
-        for name, module in wrapped.model.named_modules():
-            dw_key = f"{name}.dW"
-            if isinstance(module, _DeltaModule) and dw_key in state:
-                module.dW.data.copy_(state[dw_key])
-
-        return wrapped
-
-    # ------------------------------------------------------------------
-    # Merge & unload
-    # ------------------------------------------------------------------
-
-    def merge_and_unload(self) -> nn.Module:
-        """Merge all adapters into the base weights and return the plain model.
-
-        After calling this method the ``CriticalNeuronModel`` wrapper is
-        no longer needed; the returned model is a standard
-        ``transformers`` model with the neuron updates baked in.
-        """
-        modules = list(self.model.named_modules())
-        for name, module in modules:
-            if isinstance(module, LinearDeltaSubspace):
-                merged = module.merge_to_linear_()
-                _set_submodule(self.model, name, merged)
-            elif isinstance(module, NormDeltaSubspace):
-                merged = module.merge_to_norm_()
-                _set_submodule(self.model, name, merged)
-            elif isinstance(module, EmbeddingDeltaSubspace):
-                merged = module.merge_to_embedding_()
-                _set_submodule(self.model, name, merged)
-        return self.model
-
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
-
-    def print_trainable_parameters(self) -> None:
-        """Print the number and percentage of trainable parameters."""
-        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in self.model.parameters())
-        pct = 100.0 * n_trainable / n_total if n_total else 0
-        print(
-            f"trainable params: {n_trainable:,} || "
-            f"all params: {n_total:,} || "
-            f"trainable%: {pct:.4f}%"
-        )

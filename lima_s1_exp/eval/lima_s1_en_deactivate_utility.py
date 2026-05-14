@@ -182,8 +182,6 @@ def run_one_ratio(
                 str(neurons_file),
                 "--save_path",
                 str(out_model),
-                "--ratio",
-                str(r),
                 "--include_all_eligible_modules",
             ],
             cwd=str(repo),

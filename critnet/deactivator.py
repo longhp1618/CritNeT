@@ -1,18 +1,20 @@
-"""Neuron deactivation -- zero out detected neurons from a model's weights.
+"""In-place neuron deactivation -- zero out detected neurons in the weights.
 
-The :class:`NeuronDeactivator` sets the weight vectors of specified
-neurons to zero, effectively "pruning" them while keeping the model
-architecture intact.  This is useful for ablation studies (measuring the
-effect of removing language-specific or shared neurons) and for building
-deactivated-model baselines.
+The :class:`NeuronDeactivator` sets the weight slice of every supplied
+neuron to zero, effectively pruning the neuron while keeping the model's
+architecture intact.  The resulting checkpoint is a vanilla HuggingFace
+model and can be reloaded with ``AutoModelForCausalLM.from_pretrained``.
 
 Example
 -------
->>> from critnet import CriticalNeuronConfig, NeuronDeactivator
->>> config = CriticalNeuronConfig.from_pretrained("./detected_neurons/en")
+>>> from critnet import (
+...     CriticalNeuronConfig, NeuronDeactivator, load_neuron_indices,
+... )
+>>> config = CriticalNeuronConfig.from_pretrained("./neurons")
+>>> indices = load_neuron_indices("./neurons")
 >>> deactivator = NeuronDeactivator(model, config)
->>> stats = deactivator.deactivate()
->>> deactivator.save_pretrained("./deactivated_model")
+>>> result = deactivator.deactivate(indices)
+>>> deactivator.save_pretrained("./deactivated", tokenizer=tokenizer)
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -30,21 +32,26 @@ from .config import CriticalNeuronConfig
 logger = logging.getLogger(__name__)
 
 
+# =====================================================================
+# DeactivationResult
+# =====================================================================
+
+
 @dataclass
 class DeactivationResult:
     """Summary returned by :meth:`NeuronDeactivator.deactivate`.
 
     Attributes
     ----------
-    modules_affected : int
-        Number of modules that had neurons zeroed out.
-    neurons_zeroed : int
-        Total number of individual neurons set to zero.
-    total_weights_zeroed : int
-        Total number of scalar weight values set to zero.
-    per_module : dict[str, dict]
-        Per-module breakdown with keys ``"neurons"`` (count),
-        ``"weights"`` (scalar count), and ``"module_type"``.
+    modules_affected
+        Number of modules that had at least one neuron zeroed.
+    neurons_zeroed
+        Total neuron indices processed.
+    total_weights_zeroed
+        Total scalar weight elements set to zero.
+    per_module
+        ``module_path -> {"neurons", "weights", "module_type"}`` for
+        every module that was touched.
     """
 
     modules_affected: int = 0
@@ -53,117 +60,86 @@ class DeactivationResult:
     per_module: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def summary(self) -> str:
-        lines = [
-            f"Deactivation summary:",
-            f"  Modules affected  : {self.modules_affected}",
-            f"  Neurons zeroed    : {self.neurons_zeroed:,}",
-            f"  Weights zeroed    : {self.total_weights_zeroed:,}",
-        ]
-        return "\n".join(lines)
+        return (
+            "Deactivation summary:\n"
+            f"  Modules affected : {self.modules_affected}\n"
+            f"  Neurons zeroed   : {self.neurons_zeroed:,}\n"
+            f"  Weights zeroed   : {self.total_weights_zeroed:,}"
+        )
+
+
+# =====================================================================
+# NeuronDeactivator
+# =====================================================================
 
 
 class NeuronDeactivator:
-    """Zero out detected neurons in a model's weight tensors.
+    """Zero out chosen neurons in a model's weight tensors **in place**.
 
-    Given a set of neuron indices (from :class:`NeuronDetector` or
-    :class:`NeuronStatistician`), this class sets the corresponding
-    weight vectors to zero **in-place**, producing a model where those
-    neurons contribute nothing to the forward pass.
+    The model must be a plain HF-style stack (not wrapped by
+    :class:`~critnet.model.CriticalNeuronModel`).  The config supplies
+    module categories so the deactivator knows **which axis** to zero
+    per module.
 
-    The zeroing dimension is determined automatically from the config's
-    module categories:
+    Per module type::
 
-    * **row** modules (``q_proj``, ``up_proj``, ...): ``W[idx, :] = 0``
-    * **column** modules (``o_proj``, ``down_proj``): ``W[:, idx] = 0``
-    * **norm** modules: ``w[idx] = 0``
-    * **embedding** modules: ``E[idx, :] = 0``
-
-    Parameters
-    ----------
-    model : nn.Module
-        A pretrained ``transformers`` model (unmodified, **not** wrapped
-        with ``CriticalNeuronModel``).
-    config : CriticalNeuronConfig
-        Must have module categories configured (``row_modules``,
-        ``column_modules``, etc.) so that the zeroing dimension can be
-        resolved.  ``neuron_indices`` may be set on the config, or
-        passed directly to :meth:`deactivate`.
-
-    Example
-    -------
-    >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-    >>> config = CriticalNeuronConfig.from_pretrained("./detected_neurons/en")
-    >>> deactivator = NeuronDeactivator(model, config)
-    >>> result = deactivator.deactivate()
-    >>> print(result.summary())
-    >>> deactivator.save_pretrained("./deactivated_model")
+        row       W[idx, :] = 0
+        column    W[:, idx] = 0
+        norm      w[idx]    = 0          (and bias[idx] when present)
+        embedding E[idx, :] = 0
     """
 
-    def __init__(
-        self,
-        model: nn.Module,
-        config: CriticalNeuronConfig,
-    ) -> None:
+    def __init__(self, model: nn.Module, config: CriticalNeuronConfig) -> None:
         self.model = model
         self.config = config
 
     @torch.no_grad()
     def deactivate(
-        self,
-        neuron_indices: Optional[Dict[str, List[int]]] = None,
+        self, indices: Mapping[str, List[int]]
     ) -> DeactivationResult:
-        """Zero out specified neurons in the model's weights **in-place**.
-
-        Parameters
-        ----------
-        neuron_indices : dict[str, list[int]] or None
-            Mapping from full module path to neuron indices to deactivate.
-            If ``None``, uses ``self.config.neuron_indices``.
-
-        Returns
-        -------
-        DeactivationResult
-            Summary of what was zeroed.
+        """Zero out neurons listed in *indices* (in place).
 
         Raises
         ------
         ValueError
-            If no neuron indices are available.
+            If any module path appears in *indices* but cannot be
+            classified by ``config.classify(...)``.  Silent
+            mis-classification was the old default and would zero the
+            wrong axis -- the strict check is intentional.
         """
-        indices = neuron_indices or self.config.neuron_indices
-        if indices is None:
+        if not indices:
+            return DeactivationResult()
+
+        named = dict(self.model.named_modules())
+        unknown = [mp for mp in indices if self.config.classify(mp) is None]
+        if unknown:
             raise ValueError(
-                "No neuron indices provided. Pass neuron_indices to "
-                "deactivate() or set config.neuron_indices."
+                f"Cannot classify {len(unknown)} module(s) supplied to "
+                f"deactivate(): {unknown[:5]}{'...' if len(unknown) > 5 else ''}. "
+                "Add the missing leaf name(s) to row_modules / column_modules / "
+                "norm_modules / embedding_modules on the config, or drop them "
+                "from the indices dict."
             )
 
-        named_modules = dict(self.model.named_modules())
         result = DeactivationResult()
-
         for mod_path, neuron_idxs in indices.items():
             if not neuron_idxs:
                 continue
-
-            module = named_modules.get(mod_path)
+            module = named.get(mod_path)
             if module is None:
                 logger.warning("Module '%s' not found in model -- skipping.", mod_path)
                 continue
-
-            if not hasattr(module, "weight") or module.weight is None:
-                logger.warning("Module '%s' has no weight tensor -- skipping.", mod_path)
+            if getattr(module, "weight", None) is None:
+                logger.warning("Module '%s' has no .weight -- skipping.", mod_path)
                 continue
 
-            try:
-                mod_type = self.config.get_module_type(mod_path)
-            except ValueError:
-                logger.warning(
-                    "Module '%s' does not match any configured category -- skipping.",
-                    mod_path,
-                )
-                continue
+            mod_type = self.config.classify(mod_path)
+            assert mod_type is not None  # checked above
 
-            idx_tensor = torch.tensor(neuron_idxs, dtype=torch.long, device=module.weight.device)
-            weights_zeroed = self._zero_neurons(module, idx_tensor, mod_type)
+            idx_tensor = torch.as_tensor(
+                sorted(neuron_idxs), dtype=torch.long, device=module.weight.device
+            )
+            weights_zeroed = _zero_neurons(module, idx_tensor, mod_type)
 
             result.modules_affected += 1
             result.neurons_zeroed += len(neuron_idxs)
@@ -182,70 +158,79 @@ class NeuronDeactivator:
         )
         return result
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
     def save_pretrained(
         self,
         save_directory: str,
+        *,
         tokenizer: Optional[Any] = None,
+        indices: Optional[Mapping[str, List[int]]] = None,
     ) -> None:
-        """Save the deactivated model as a standard HuggingFace checkpoint.
+        """Save the (now-deactivated) model, the config, and optional extras.
 
-        Parameters
-        ----------
-        save_directory : str
-            Output directory for the full model checkpoint.
-        tokenizer : optional
-            If provided, the tokenizer is saved alongside the model.
+        Convenience wrapper around::
+
+            model.save_pretrained(save_directory)
+            tokenizer.save_pretrained(save_directory)        # if provided
+            config.save_pretrained(save_directory, indices=indices)
         """
         os.makedirs(save_directory, exist_ok=True)
         self.model.save_pretrained(save_directory)
         if tokenizer is not None:
             tokenizer.save_pretrained(save_directory)
-        self.config.save_pretrained(save_directory)
+        self.config.save_pretrained(
+            save_directory,
+            indices=dict(indices) if indices is not None else None,
+        )
         logger.info("Deactivated model saved to %s", save_directory)
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _zero_neurons(
-        module: nn.Module,
-        idx: torch.Tensor,
-        mod_type: str,
-    ) -> int:
-        """Zero out neuron weights and return the count of scalar weights set to zero."""
-        w = module.weight
-        count = 0
+# =====================================================================
+# Internals
+# =====================================================================
 
-        if mod_type == "row":
-            if w.dim() == 2:
-                w.data[idx, :] = 0
-                count = idx.numel() * w.size(1)
-            else:
-                w.data[idx] = 0
-                count = idx.numel()
 
-        elif mod_type == "column":
-            if w.dim() == 2:
-                w.data[:, idx] = 0
-                count = w.size(0) * idx.numel()
-            else:
-                w.data[idx] = 0
-                count = idx.numel()
+@torch.no_grad()
+def _zero_neurons(
+    module: nn.Module,
+    idx: torch.Tensor,
+    mod_type: str,
+) -> int:
+    """Zero out *idx* on *module* along the axis implied by *mod_type*.
 
-        elif mod_type == "norm":
-            w.data[idx] = 0
-            count = idx.numel()
-            if hasattr(module, "bias") and module.bias is not None:
-                module.bias.data[idx] = 0
-                count += idx.numel()
+    Returns the count of scalar weight elements that were set to zero.
+    """
+    w = module.weight
+    if mod_type == "row":
+        if w.dim() == 2:
+            w.data[idx, :] = 0
+            return idx.numel() * w.size(1)
+        w.data[idx] = 0
+        return idx.numel()
 
-        elif mod_type == "embedding":
-            if w.dim() == 2:
-                w.data[idx, :] = 0
-                count = idx.numel() * w.size(1)
-            else:
-                w.data[idx] = 0
-                count = idx.numel()
+    if mod_type == "column":
+        if w.dim() == 2:
+            w.data[:, idx] = 0
+            return w.size(0) * idx.numel()
+        w.data[idx] = 0
+        return idx.numel()
 
+    if mod_type == "norm":
+        w.data[idx] = 0
+        count = idx.numel()
+        if getattr(module, "bias", None) is not None:
+            module.bias.data[idx] = 0
+            count += idx.numel()
         return count
+
+    if mod_type == "embedding":
+        if w.dim() == 2:
+            w.data[idx, :] = 0
+            return idx.numel() * w.size(1)
+        w.data[idx] = 0
+        return idx.numel()
+
+    raise ValueError(f"Unknown module type {mod_type!r}.")  # defensive

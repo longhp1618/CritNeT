@@ -1,3 +1,10 @@
+"""Multilingual neuron-set statistics.
+
+For a fixed sparsity ratio, computes set algebra (union / intersection /
+per-task exclusive / non-shared) over per-language critical-neuron sets
+and dumps the resulting JSON / CSV report.
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -42,7 +49,6 @@ def _build_config(args: argparse.Namespace) -> CriticalNeuronConfig:
 
     if args.include_all_eligible_modules:
         args.include_attention_norms = True
-
     if args.include_attention_norms:
         norm_modules = _merge_unique(norm_modules, ["q_norm", "k_norm"])
 
@@ -52,19 +58,18 @@ def _build_config(args: argparse.Namespace) -> CriticalNeuronConfig:
         column_modules=col_modules,
         norm_modules=norm_modules,
         embedding_modules=emb_modules,
-        sparsity_ratio=args.ratio,
     )
 
 
 def main() -> None:
-    # Example:
-    # python -m lima_s1_exp.exp5_multilingual_critical_foundational.neuron_statistics --model_name "Qwen/Qwen3-0.6B" --neurons_path "./neuron_train_data_detect" --ratio 0.05 --langs "en,zh,ar,sw"
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--neurons_path", type=str, default="./neuron_detect")
     parser.add_argument("--save_path", type=str, default="./neuron_statistics")
-    parser.add_argument("--ratio", type=float, default=0.05)
-    parser.add_argument("--langs", type=str, default="en,zh,ar,sw", help="Comma-separated languages")
+    parser.add_argument("--ratio", type=float, default=0.05,
+                        help="Used only to locate the ratio<...> folder under --neurons_path.")
+    parser.add_argument("--langs", type=str, default="en,zh,ar,sw",
+                        help="Comma-separated languages")
 
     parser.add_argument("--row_modules", type=str, default=None)
     parser.add_argument("--column_modules", type=str, default=None)
@@ -77,15 +82,13 @@ def main() -> None:
 
     config = _build_config(args)
 
-    base_dir = Path(args.neurons_path) / args.model_name/ args.stype / f"ratio{args.ratio}"
+    base_dir = Path(args.neurons_path) / args.model_name / args.stype / f"ratio{args.ratio}"
     save_dir = Path(args.save_path) / args.model_name / args.stype / f"ratio{args.ratio}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
     lang_list = [lang.strip() for lang in args.langs.split(",") if lang.strip()]
     task_indices: Dict[str, Dict[str, List[int]]] = {}
     for lang in lang_list:
-        # Support toolkit folder (<base>/ratioX/<lang>/neuron_indices.json)
-        # and legacy flat json (<base>/ratioX/<lang>.json)
         folder_path = base_dir / lang
         flat_path = base_dir / f"{lang}.json"
         if folder_path.is_dir():
@@ -94,18 +97,14 @@ def main() -> None:
             task_indices[lang] = _load_indices(flat_path)
         else:
             print(f"Skipping {lang}: no neuron file found.")
-
     if not task_indices:
         raise ValueError(f"No neuron indices found under {base_dir}")
 
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    statistician = NeuronStatistician(model=model, config=config)
-    result = statistician.analyze(task_indices)
+    result = NeuronStatistician(model=model, config=config).analyze(task_indices)
 
-    print(result.summary(task_indices=task_indices))
-    statistician.save_report(str(save_dir))
-
-
+    print(result.summary())
+    result.save_report(str(save_dir))
     print(f"Saved statistics and neuron partitions to: {save_dir}")
 
 
