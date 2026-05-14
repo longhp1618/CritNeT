@@ -28,7 +28,7 @@ The [Quickstart](#quickstart-isolate-the-safety-neurons-of-llama-31-8b-instruct)
 pip install datasets trl
 ```
 
-A single GPU with ≥ 24 GB of memory (e.g. A100/H100/RTX A6000) is enough to run the Quickstart on Llama-3.1-8B in bfloat16.
+A single GPU with ≥ 40 GB of memory is enough to run the Quickstart on Qwen3-4B-Instruct in bfloat16.
 
 ---
 
